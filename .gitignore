@@ -1,0 +1,22 @@
+# Secrets / environment
+.env
+/etc/edge-router/env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+.claude/

@@ -1,0 +1,104 @@
+# edge-router.service — systemd unit for the edge-router FastAPI app
+#
+# ── QUICK INSTALL (Jetson Orin Nano) ─────────────────────────────────────────
+#
+#  1. Create the env file directory and populate it:
+#       sudo mkdir -p /etc/edge-router
+#       sudo cp /home/jeffpaz/edge-router/env.example /etc/edge-router/env
+#       sudo chmod 600 /etc/edge-router/env        # root-readable only
+#       sudo nano /etc/edge-router/env             # fill in API keys
+#
+#  2. Install the unit file:
+#       sudo cp /home/jeffpaz/edge-router/edge-router.service \
+#               /etc/systemd/system/edge-router.service
+#
+#  3. Reload systemd and enable the service:
+#       sudo systemctl daemon-reload
+#       sudo systemctl enable edge-router          # start on every boot
+#       sudo systemctl start edge-router
+#
+#  4. Check it is running:
+#       sudo systemctl status edge-router
+#       curl http://localhost:8000/health
+#
+#  5. Follow live logs:
+#       sudo journalctl -u edge-router -f
+#
+#  6. To stop or restart:
+#       sudo systemctl stop edge-router
+#       sudo systemctl restart edge-router
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+[Unit]
+Description=edge-router — local-first LLM query router (Ollama + cloud fallback)
+Documentation=file:///home/jeffpaz/edge-router/README.md
+# Start after the network is up. Soft-depend on ollama: try to start it but
+# do not block edge-router if ollama is absent (health endpoint will report degraded).
+After=network.target ollama.service
+Wants=ollama.service
+
+# Allow up to 5 rapid restart attempts within 60 s before giving up.
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+Type=exec
+
+# ── Identity ─────────────────────────────────────────────────────────────────
+User=jeffpaz
+Group=jeffpaz
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+WorkingDirectory=/home/jeffpaz/edge-router
+
+# API keys and tunables — must exist; see env.example for the required keys.
+EnvironmentFile=/etc/edge-router/env
+
+# Non-secret defaults set here so they can be overridden in the env file.
+Environment="OLLAMA_BASE_URL=http://localhost:11434"
+Environment="OLLAMA_MODEL=llama3.2:3b"
+Environment="CONFIDENCE_THRESHOLD=0.70"
+
+# Suppress .pyc writes (nothing to write to under strict hardening).
+Environment="PYTHONDONTWRITEBYTECODE=1"
+# Ensure stdout/stderr reach journald immediately.
+Environment="PYTHONUNBUFFERED=1"
+
+# ── Process ──────────────────────────────────────────────────────────────────
+ExecStart=/home/jeffpaz/venvs/edge-router/bin/uvicorn main:app \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --workers 1 \
+    --log-level warning \
+    --no-access-log
+
+# --workers 1  Prevents multiple Python processes from competing for the
+#              Jetson's unified GPU memory while Ollama is also running.
+# --log-level warning  Suppresses uvicorn's own INFO lines; the app emits
+#              structured JSON logs directly to stdout.
+
+# ── Restart policy ───────────────────────────────────────────────────────────
+Restart=on-failure
+RestartSec=5s
+
+# ── Hardening ────────────────────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Make /usr, /boot, /etc read-only from the service's perspective.
+# /etc/edge-router/env is still readable (read-only is fine; only write is blocked).
+ProtectSystem=strict
+
+# Home directories are readable but not writable (our app only reads project
+# files and logs to stdout). Remove or weaken this if a library writes to ~/.cache.
+ProtectHome=read-only
+
+# Limit what the process can do if compromised.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

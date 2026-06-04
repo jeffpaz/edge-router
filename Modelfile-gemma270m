@@ -1,0 +1,9 @@
+FROM gemma3:270m
+
+# Conservative for 8GB Orin Nano
+PARAMETER num_gpu 8
+PARAMETER num_ctx 1024
+PARAMETER temperature 0.7
+
+# Keep model loaded
+SYSTEM You are a helpful coding assistant.
