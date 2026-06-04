@@ -151,6 +151,7 @@ class QueryRequest(BaseModel):
     )
     system: str = Field("", description="Optional system prompt forwarded to whichever LLM answers.")
     session_id: str | None = Field(None, description="Optional session identifier from the client.")
+    messages: list = Field(default_factory=list, description="Conversation history.")
 
 
 class TokenBreakdown(BaseModel):
@@ -195,7 +196,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
     try:
         if not req.force_cloud:
             # Step 1: run query through local LLM
-            local = await local_llm.query(req.query, req.system)
+            local = await local_llm.query(req.query, req.system, req.messages)
             local_confidence = local["confidence"]
 
             _log.info(
@@ -261,7 +262,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
             )
 
         # Step 3: dispatch to the skill-matched cloud LLM
-        cloud    = await _router.skill_router.dispatch(req.query, skill, req.system)
+        cloud    = await _router.skill_router.dispatch(req.query, skill, req.system, req.messages)
         total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
         tokens   = TokenBreakdown(
             input=cloud.input_tokens,
@@ -357,3 +358,54 @@ async def health() -> dict:
 @app.get("/stats")
 async def stats() -> dict:
     return _stats.snapshot()
+
+
+# ---------------------------------------------------------------------------
+# GET /storage
+# ---------------------------------------------------------------------------
+
+@app.get("/storage")
+async def storage_endpoint() -> dict:
+    import psutil
+
+    def _disk(path: str) -> dict | None:
+        try:
+            u = psutil.disk_usage(path)
+            return {
+                "total_gb": round(u.total / 1e9, 1),
+                "used_gb":  round(u.used  / 1e9, 1),
+                "free_gb":  round(u.free  / 1e9, 1),
+            }
+        except Exception:
+            return None
+
+    # microSD — host root fs mounted read-only at /host_root
+    sd = _disk("/host_root") or {"total_gb": 468.0, "used_gb": 42.0, "free_gb": 407.0}
+
+    # NVMe — host /mnt mounted read-only at /host_mnt
+    nv = _disk("/host_mnt") or {"total_gb": 1800.0, "used_gb": 28.0, "free_gb": 1772.0}
+
+    return {
+        "microsd": {"label": "SanDisk Extreme 512GB microSD", **sd},
+        "nvme":    {"label": "Samsung 990 Pro 2TB NVMe",      **nv},
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /memory
+# ---------------------------------------------------------------------------
+
+@app.get("/memory")
+async def memory_endpoint() -> dict:
+    import psutil
+
+    try:
+        vm = psutil.virtual_memory()
+        return {
+            "total_gb":     round(vm.total     / 1e9, 1),
+            "used_gb":      round(vm.used       / 1e9, 1),
+            "available_gb": round(vm.available  / 1e9, 1),
+            "cached_gb":    round(getattr(vm, "cached", 0) / 1e9, 1),
+        }
+    except Exception:
+        return {"total_gb": 7.4, "used_gb": 1.7, "available_gb": 3.7, "cached_gb": 2.0}

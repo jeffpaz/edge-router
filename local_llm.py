@@ -178,7 +178,7 @@ async def _generate(prompt: str, system: str) -> tuple[str, list[float] | None, 
 # Public API
 # ---------------------------------------------------------------------------
 
-async def query(prompt: str, system: str = "") -> dict:
+async def query(prompt: str, system: str = "", messages: list = []) -> dict:
     """
     Query the local Ollama model and return a confidence-scored result.
 
@@ -191,9 +191,18 @@ async def query(prompt: str, system: str = "") -> dict:
         completion_tokens – tokens in the response
         signals         – individual signal values for debugging / logging
     """
+    if messages:
+        history_text = "Previous conversation:\n"
+        for m in messages:
+            role = "User" if m["role"] == "user" else "Assistant"
+            history_text += f"{role}: {m['content']}\n"
+        full_prompt = f"{history_text}\nCurrent question: {prompt}"
+    else:
+        full_prompt = prompt
+
     try:
         raw_text, logprobs, prompt_tokens, completion_tokens = await _generate(
-            prompt=prompt + _SELF_RATE_SUFFIX,
+            prompt=full_prompt + _SELF_RATE_SUFFIX,
             system=system,
         )
     except httpx.HTTPStatusError as exc:

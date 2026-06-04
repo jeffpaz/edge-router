@@ -75,6 +75,7 @@ class SkillRouter:
         query: str,
         skill: str,
         system: str = "",
+        messages: list = [],
     ) -> cloud_llms.CloudResponse:
         """Call the cloud LLM mapped to skill and log the routing decision."""
         provider, model = self._SKILL_MAP.get(skill, self._SKILL_MAP["general"])
@@ -88,7 +89,7 @@ class SkillRouter:
             query,
         )
 
-        return await cloud_llms.query(provider, query, system, model=model)
+        return await cloud_llms.query(provider, query, system, model=model, messages=messages)
 
 
 # Module-level singleton — import and call directly if needed.

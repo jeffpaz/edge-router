@@ -49,7 +49,7 @@ class CloudResponse:
 # Provider functions
 # ---------------------------------------------------------------------------
 
-async def query_claude(prompt: str, system: str = "", model: str | None = None) -> CloudResponse:
+async def query_claude(prompt: str, system: str = "", model: str | None = None, messages: list = []) -> CloudResponse:
     import anthropic
 
     resolved = model or config.CLAUDE_MODEL
@@ -57,7 +57,7 @@ async def query_claude(prompt: str, system: str = "", model: str | None = None) 
     kwargs: dict = {
         "model": resolved,
         "max_tokens": 2048,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [*messages, {"role": "user", "content": prompt}],
     }
     if system:
         kwargs["system"] = system
@@ -83,7 +83,7 @@ async def query_claude(prompt: str, system: str = "", model: str | None = None) 
     raise RuntimeError("unreachable")  # satisfies type checkers
 
 
-async def query_gemini(prompt: str, system: str = "", model: str | None = None) -> CloudResponse:
+async def query_gemini(prompt: str, system: str = "", model: str | None = None, messages: list = []) -> CloudResponse:
     import google.generativeai as genai
     from google.api_core.exceptions import ResourceExhausted
 
@@ -93,11 +93,16 @@ async def query_gemini(prompt: str, system: str = "", model: str | None = None) 
         model_name=resolved,
         system_instruction=system or None,
     )
+    chat_history = [
+        {"role": m["role"], "parts": [m["content"]]}
+        for m in messages
+    ]
 
     for attempt in range(_MAX_RETRIES + 1):
         try:
             t0 = time.perf_counter()
-            response = await gmodel.generate_content_async(prompt)
+            chat = gmodel.start_chat(history=chat_history)
+            response = await chat.send_message_async(prompt)
             latency_ms = (time.perf_counter() - t0) * 1000
             usage = response.usage_metadata
             return CloudResponse(
@@ -116,22 +121,23 @@ async def query_gemini(prompt: str, system: str = "", model: str | None = None) 
     raise RuntimeError("unreachable")
 
 
-async def query_grok(prompt: str, system: str = "", model: str | None = None) -> CloudResponse:
+async def query_grok(prompt: str, system: str = "", model: str | None = None, messages: list = []) -> CloudResponse:
     # xAI Grok exposes an OpenAI-compatible API.
     import openai
     from openai import AsyncOpenAI
 
     resolved = model or config.GROK_MODEL
     client = AsyncOpenAI(api_key=config.XAI_API_KEY, base_url="https://api.x.ai/v1")
-    messages = []
+    api_messages = []
     if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
+        api_messages.append({"role": "system", "content": system})
+    api_messages.extend(messages)
+    api_messages.append({"role": "user", "content": prompt})
 
     for attempt in range(_MAX_RETRIES + 1):
         try:
             t0 = time.perf_counter()
-            completion = await client.chat.completions.create(model=resolved, messages=messages)
+            completion = await client.chat.completions.create(model=resolved, messages=api_messages)
             latency_ms = (time.perf_counter() - t0) * 1000
             usage = completion.usage
             return CloudResponse(
@@ -150,21 +156,22 @@ async def query_grok(prompt: str, system: str = "", model: str | None = None) ->
     raise RuntimeError("unreachable")
 
 
-async def query_openai(prompt: str, system: str = "", model: str | None = None) -> CloudResponse:
+async def query_openai(prompt: str, system: str = "", model: str | None = None, messages: list = []) -> CloudResponse:
     import openai
     from openai import AsyncOpenAI
 
     resolved = model or config.OPENAI_MODEL
     client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
-    messages = []
+    api_messages = []
     if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
+        api_messages.append({"role": "system", "content": system})
+    api_messages.extend(messages)
+    api_messages.append({"role": "user", "content": prompt})
 
     for attempt in range(_MAX_RETRIES + 1):
         try:
             t0 = time.perf_counter()
-            completion = await client.chat.completions.create(model=resolved, messages=messages)
+            completion = await client.chat.completions.create(model=resolved, messages=api_messages)
             latency_ms = (time.perf_counter() - t0) * 1000
             usage = completion.usage
             return CloudResponse(
@@ -200,8 +207,9 @@ async def query(
     prompt: str,
     system: str = "",
     model: str | None = None,
+    messages: list = [],
 ) -> CloudResponse:
     fn = _PROVIDERS.get(provider)
     if fn is None:
         raise ValueError(f"Unknown provider: {provider!r}. Choose from {list(_PROVIDERS)}")
-    return await fn(prompt, system, model)
+    return await fn(prompt, system, model, messages)
