@@ -3,6 +3,9 @@ FROM python:3.11-slim
 # Create a non-root user before installing anything
 RUN useradd -m -u 1000 appuser
 
+# Add appuser to the docker group (GID 995 on this host) so it can access the socket
+RUN groupadd -g 995 docker && usermod -aG docker appuser
+
 WORKDIR /app
 
 # ── Layer 1: dependencies (cached unless requirements.txt changes) ────────────

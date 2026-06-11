@@ -1,15 +1,22 @@
+import asyncio
+import hashlib
 import json
 import logging
+import os
+import re
+import sqlite3
+import subprocess
 import time
 import uuid
-from collections import deque
+from collections import deque, OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 import cloud_llms
@@ -48,8 +55,10 @@ class _JsonFormatter(logging.Formatter):
 
 def _configure_logging() -> None:
     root = logging.getLogger("edge_router")
+    # Remove NullHandlers added by library-style imports in submodules
+    root.handlers = [h for h in root.handlers if not isinstance(h, logging.NullHandler)]
     if root.handlers:
-        return
+        return  # Real handler already installed
     handler = logging.StreamHandler()
     handler.setFormatter(_JsonFormatter())
     root.addHandler(handler)
@@ -66,9 +75,7 @@ _log = logging.getLogger("edge_router.main")
 # ---------------------------------------------------------------------------
 
 class _StatsStore:
-    """Bounded deque of the last 100 query records.
-    Thread-safe under asyncio's single-threaded event loop.
-    """
+    """Bounded deque of the last 100 query records."""
 
     def __init__(self) -> None:
         self.total: int = 0
@@ -86,6 +93,233 @@ class _StatsStore:
 
 
 _stats = _StatsStore()
+
+
+# ---------------------------------------------------------------------------
+# Local answer cache  (in-memory, restart-cleared, max CACHE_MAX_SIZE entries)
+# ---------------------------------------------------------------------------
+
+_QUERY_CACHE: OrderedDict = OrderedDict()
+
+
+def _cache_key(query: str) -> str:
+    return hashlib.sha256(query.strip().lower().encode()).hexdigest()
+
+
+def _cache_get(query: str) -> dict | None:
+    key = _cache_key(query)
+    entry = _QUERY_CACHE.get(key)
+    if entry is not None:
+        _log.info(
+            "cache_hit query_preview=%.50s",
+            query[:50],
+            extra={"event": "cache_hit", "query_preview": query[:50]},
+        )
+        return entry
+    _log.info(
+        "cache_miss query_preview=%.50s",
+        query[:50],
+        extra={"event": "cache_miss", "query_preview": query[:50]},
+    )
+    return None
+
+
+def _cache_put(query: str, data: dict, skill: str, confidence: float) -> None:
+    threshold = config.SKILL_THRESHOLDS.get(skill, config.CONFIDENCE_THRESHOLD)
+    if confidence < threshold:
+        return
+    key = _cache_key(query)
+    if key in _QUERY_CACHE:
+        del _QUERY_CACHE[key]
+    _QUERY_CACHE[key] = data
+    while len(_QUERY_CACHE) > config.CACHE_MAX_SIZE:
+        _QUERY_CACHE.popitem(last=False)  # evict oldest
+    _log.info(
+        "cache_store skill=%s confidence=%.4f size=%d",
+        skill,
+        confidence,
+        len(_QUERY_CACHE),
+        extra={"event": "cache_store", "skill": skill, "confidence": confidence, "cache_size": len(_QUERY_CACHE)},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Billing probe cache  (5-minute TTL — avoids burning quota on status checks)
+# ---------------------------------------------------------------------------
+
+_BILLING_TTL: float = 300.0  # seconds
+_billing_cache: dict[str, dict] = {}
+
+
+def _classify_billing_exc(exc: Exception) -> str:
+    """Return 'quota' for billing/credit/rate-limit errors, 'error' for everything else."""
+    err_str = str(exc).lower()
+    quota_keywords = (
+        "quota", "credit", "billing", "insufficient", "rate limit", "rate_limit",
+        "payment", "balance", "permission", "does not have permission",
+    )
+    if any(kw in err_str for kw in quota_keywords):
+        return "quota"
+    for attr in ("status_code", "status", "code"):
+        code = getattr(exc, attr, None)
+        if isinstance(code, int) and code in (400, 402, 403, 429):
+            return "quota"
+    return "error"
+
+
+async def _billing_probe(provider: str) -> dict:
+    """Make one minimal API call (no retries) and return {status, error_detail}."""
+    try:
+        if provider == "claude":
+            import anthropic
+            client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
+            await client.messages.create(
+                model=config.CLAUDE_MODEL,
+                max_tokens=1,
+                messages=[{"role": "user", "content": "1"}],
+            )
+
+        elif provider == "gemini":
+            import google.generativeai as genai
+            genai.configure(api_key=config.GOOGLE_API_KEY)
+            gmodel = genai.GenerativeModel(model_name=config.GEMINI_MODEL)
+            await gmodel.generate_content_async("1")
+
+        elif provider == "openai":
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+            await client.chat.completions.create(
+                model=config.OPENAI_MODEL,
+                max_tokens=1,
+                messages=[{"role": "user", "content": "1"}],
+            )
+
+        elif provider == "grok":
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(api_key=config.XAI_API_KEY, base_url="https://api.x.ai/v1")
+            await client.chat.completions.create(
+                model=config.GROK_MODEL,
+                max_tokens=1,
+                messages=[{"role": "user", "content": "1"}],
+            )
+
+        else:
+            return {"status": "error", "error_detail": None}
+
+        return {"status": "ok", "error_detail": None}
+
+    except Exception as exc:
+        detail = str(exc)
+        # Try to pull a cleaner message from HTTP exceptions
+        for attr in ("message", "args"):
+            val = getattr(exc, attr, None)
+            if isinstance(val, str) and val:
+                detail = val[:200]
+                break
+            elif isinstance(val, tuple) and val:
+                detail = str(val[0])[:200]
+                break
+        return {"status": _classify_billing_exc(exc), "error_detail": detail}
+
+
+async def _get_billing_status(provider: str) -> dict:
+    """Return cached status if fresh; otherwise probe the provider."""
+    now = time.time()
+    cached = _billing_cache.get(provider)
+    if cached and now < cached["_expires"]:
+        return cached
+
+    probe = await _billing_probe(provider)
+    entry: dict = {
+        "status":       probe["status"],
+        "error_detail": probe["error_detail"],
+        "checked_at":   datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "_expires":     now + _BILLING_TTL,
+    }
+    _billing_cache[provider] = entry
+    _log.info(
+        "billing_check provider=%s status=%s",
+        provider, probe["status"],
+        extra={"provider": provider, "status": probe["status"]},
+    )
+    return entry
+
+
+# ---------------------------------------------------------------------------
+# System metrics  (SQLite collector — GPU/CPU/RAM every 60 s)
+# ---------------------------------------------------------------------------
+
+_METRICS_DB = "/app/data/metrics.db"
+
+
+def _init_metrics_db() -> None:
+    os.makedirs(os.path.dirname(_METRICS_DB), exist_ok=True)
+    con = sqlite3.connect(_METRICS_DB)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS system_metrics (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp    DATETIME DEFAULT CURRENT_TIMESTAMP,
+            cpu_pct      REAL,
+            gpu_pct      REAL,
+            ram_used_mb  INTEGER,
+            ram_total_mb INTEGER
+        )
+    """)
+    con.commit()
+    con.close()
+
+
+def _sample_gpu_pct() -> float:
+    """Run tegrastats for one line and parse GR3D_FREQ %."""
+    tegrastats = "/host_root/usr/bin/tegrastats"
+    if not os.path.exists(tegrastats):
+        return 0.0
+    try:
+        proc = subprocess.Popen(
+            [tegrastats],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, bufsize=1,
+        )
+        line = proc.stdout.readline()
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        m = re.search(r"GR3D_FREQ\s+(\d+)%", line)
+        return float(m.group(1)) if m else 0.0
+    except Exception:
+        return 0.0
+
+
+def _record_one_sample() -> None:
+    import psutil
+    cpu = psutil.cpu_percent(interval=1)
+    vm  = psutil.virtual_memory()
+    gpu = _sample_gpu_pct()
+    ram_used  = vm.used  // (1024 * 1024)
+    ram_total = vm.total // (1024 * 1024)
+    con = sqlite3.connect(_METRICS_DB)
+    con.execute(
+        "INSERT INTO system_metrics (cpu_pct, gpu_pct, ram_used_mb, ram_total_mb) "
+        "VALUES (?, ?, ?, ?)",
+        (cpu, gpu, ram_used, ram_total),
+    )
+    con.execute("DELETE FROM system_metrics WHERE timestamp < datetime('now', '-7 days')")
+    con.commit()
+    con.close()
+
+
+async def _metrics_collector_loop() -> None:
+    _init_metrics_db()
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            await loop.run_in_executor(None, _record_one_sample)
+            _log.debug("metrics_collected")
+        except Exception as exc:
+            _log.warning("metrics_collect_error", extra={"error": str(exc)})
+        await asyncio.sleep(60)
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +350,18 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         _log.warning("ollama_unreachable", extra={"error": str(exc)})
 
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"{config.OLLAMA_BASE_URL}/api/generate",
+                json={"model": config.OLLAMA_MODEL, "keep_alive": "10m"},
+            )
+        _log.info("ollama_warmup_sent")
+    except Exception as exc:
+        _log.warning("ollama_warmup_failed", extra={"error": str(exc)})
+
+    asyncio.create_task(_metrics_collector_loop())
+
     yield
 
     _log.info("shutdown", extra={"total_queries": _stats.total})
@@ -137,6 +383,36 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Global exception handler — last resort, always returns 200 with JSON
+# ---------------------------------------------------------------------------
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    _log.error(
+        "unhandled_error path=%s method=%s error=%s",
+        request.url.path,
+        request.method,
+        exc,
+        extra={"path": request.url.path, "error": str(exc), "error_type": type(exc).__name__},
+        exc_info=True,
+    )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "answer": "Sorry, I ran into an issue processing that request. Please try again.",
+            "source": "error",
+            "model_used": "none",
+            "skill": "unknown",
+            "latency_ms": 0,
+            "confidence_score": 0,
+            "tokens": {"input": 0, "output": 0, "total": 0},
+            "session_id": None,
+            "error": str(exc),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -162,13 +438,14 @@ class TokenBreakdown(BaseModel):
 
 class QueryResponse(BaseModel):
     answer: str
-    source: str                        # "local" | cloud provider name
+    source: str                        # "local" | cloud provider name | "error"
     model_used: str
     skill: str
     latency_ms: float
     confidence_score: float | None     # local model confidence; None when force_cloud=True
     tokens: TokenBreakdown
     session_id: str | None
+    cache_hit: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +453,7 @@ class QueryResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 @app.post("/query", response_model=QueryResponse)
-async def query_endpoint(req: QueryRequest) -> QueryResponse:
+async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
     req_id = uuid.uuid4().hex[:8]
     t_wall = time.perf_counter()
 
@@ -190,14 +467,44 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
         },
     )
 
+    # ── Cache check — return immediately on hit, skip all inference ──────────
+    if not req.force_cloud:
+        cached = _cache_get(req.query)
+        if cached is not None:
+            tokens = TokenBreakdown(**cached["tokens"])
+            _stats.record({
+                "ts":               datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "session_id":       req.session_id,
+                "source":           cached["source"],
+                "model_used":       cached["model_used"],
+                "skill":            cached["skill"],
+                "latency_ms":       0.0,
+                "confidence_score": cached["confidence_score"],
+                "tokens":           tokens.model_dump(),
+                "status":           "cache_hit",
+            })
+            return QueryResponse(
+                answer=cached["answer"],
+                source=cached["source"],
+                model_used=cached["model_used"],
+                skill=cached["skill"],
+                latency_ms=0.0,
+                confidence_score=cached["confidence_score"],
+                tokens=tokens,
+                session_id=req.session_id,
+                cache_hit=True,
+            )
+
     skill = _router.skill_router.classify(req.query)
     local_confidence: float | None = None
+    local_answer: str | None = None
 
     try:
         if not req.force_cloud:
             # Step 1: run query through local LLM
-            local = await local_llm.query(req.query, req.system, req.messages)
+            local = await local_llm.query(req.query, req.system, req.messages, skill=skill)
             local_confidence = local["confidence"]
+            local_answer = local["answer"]
 
             _log.info(
                 "local_inference",
@@ -210,14 +517,32 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
                 },
             )
 
-            # Step 2: confidence is sufficient — return local answer
-            if not local["should_escalate"]:
+            # Local-only skills — always return local answer, never escalate
+            if skill in _router.LOCAL_ONLY_SKILLS:
                 total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
                 tokens   = TokenBreakdown(
                     input=local["prompt_tokens"],
                     output=local["completion_tokens"],
                     total=local["prompt_tokens"] + local["completion_tokens"],
                 )
+                _log.info(
+                    "local-only skill — no escalation",
+                    extra={
+                        "req_id":     req_id,
+                        "session_id": req.session_id,
+                        "skill":      skill,
+                        "confidence": local["confidence"],
+                        "routed_to":  "ollama",
+                    },
+                )
+                _cache_put(req.query, {
+                    "answer":           local["answer"],
+                    "source":           "local",
+                    "model_used":       local["model"],
+                    "skill":            skill,
+                    "confidence_score": local["confidence"],
+                    "tokens":           tokens.model_dump(),
+                }, skill, local["confidence"])
                 _stats.record({
                     "ts":               datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                     "session_id":       req.session_id,
@@ -227,6 +552,45 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
                     "latency_ms":       total_ms,
                     "confidence_score": local_confidence,
                     "tokens":           tokens.model_dump(),
+                    "status":           "success",
+                })
+                return QueryResponse(
+                    answer=local["answer"],
+                    source="local",
+                    model_used=local["model"],
+                    skill=skill,
+                    latency_ms=total_ms,
+                    confidence_score=local_confidence,
+                    tokens=tokens,
+                    session_id=req.session_id,
+                )
+
+            # Step 2: confidence is sufficient — return local answer
+            if not local["should_escalate"]:
+                total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
+                tokens   = TokenBreakdown(
+                    input=local["prompt_tokens"],
+                    output=local["completion_tokens"],
+                    total=local["prompt_tokens"] + local["completion_tokens"],
+                )
+                _cache_put(req.query, {
+                    "answer":           local["answer"],
+                    "source":           "local",
+                    "model_used":       local["model"],
+                    "skill":            skill,
+                    "confidence_score": local["confidence"],
+                    "tokens":           tokens.model_dump(),
+                }, skill, local["confidence"])
+                _stats.record({
+                    "ts":               datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                    "session_id":       req.session_id,
+                    "source":           "local",
+                    "model_used":       local["model"],
+                    "skill":            skill,
+                    "latency_ms":       total_ms,
+                    "confidence_score": local_confidence,
+                    "tokens":           tokens.model_dump(),
+                    "status":           "success",
                 })
                 _log.info(
                     "routed",
@@ -238,6 +602,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
                         "skill":      skill,
                         "latency_ms": total_ms,
                         "tokens":     tokens.model_dump(),
+                        "status":     "success",
                     },
                 )
                 return QueryResponse(
@@ -251,24 +616,94 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
                     session_id=req.session_id,
                 )
 
+            # Step 2b: local-first retry with simplified query (general and coding only)
+            if config.RETRY_ENABLED and skill in ("general", "coding"):
+                simplified = _router._simplify_query(req.query)
+                if simplified != req.query:
+                    _log.info(
+                        "local_retry_attempt req_id=%s skill=%s simplified_preview=%.60s",
+                        req_id,
+                        skill,
+                        simplified[:60],
+                        extra={"req_id": req_id, "skill": skill, "simplified_preview": simplified[:60]},
+                    )
+                    retry_local = await local_llm.query(simplified, req.system, req.messages, skill=skill)
+                    if not retry_local["should_escalate"]:
+                        total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
+                        tokens   = TokenBreakdown(
+                            input=retry_local["prompt_tokens"],
+                            output=retry_local["completion_tokens"],
+                            total=retry_local["prompt_tokens"] + retry_local["completion_tokens"],
+                        )
+                        _log.info(
+                            "local retry succeeded — escalation avoided skill=%s confidence=%.4f",
+                            skill,
+                            retry_local["confidence"],
+                            extra={
+                                "req_id":     req_id,
+                                "skill":      skill,
+                                "confidence": retry_local["confidence"],
+                            },
+                        )
+                        _cache_put(req.query, {
+                            "answer":           retry_local["answer"],
+                            "source":           "local",
+                            "model_used":       retry_local["model"],
+                            "skill":            skill,
+                            "confidence_score": retry_local["confidence"],
+                            "tokens":           tokens.model_dump(),
+                        }, skill, retry_local["confidence"])
+                        _stats.record({
+                            "ts":               datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                            "session_id":       req.session_id,
+                            "source":           "local",
+                            "model_used":       retry_local["model"],
+                            "skill":            skill,
+                            "latency_ms":       total_ms,
+                            "confidence_score": retry_local["confidence"],
+                            "tokens":           tokens.model_dump(),
+                            "status":           "retry_success",
+                        })
+                        return QueryResponse(
+                            answer=retry_local["answer"],
+                            source="local",
+                            model_used=retry_local["model"],
+                            skill=skill,
+                            latency_ms=total_ms,
+                            confidence_score=retry_local["confidence"],
+                            tokens=tokens,
+                            session_id=req.session_id,
+                        )
+                    _log.info(
+                        "local_retry_failed skill=%s retry_confidence=%.4f — escalating to cloud",
+                        skill,
+                        retry_local["confidence"],
+                        extra={"req_id": req_id, "skill": skill, "retry_confidence": retry_local["confidence"]},
+                    )
+
             _log.info(
                 "escalating_to_cloud",
                 extra={
                     "req_id":     req_id,
                     "skill":      skill,
                     "confidence": local["confidence"],
-                    "threshold":  config.CONFIDENCE_THRESHOLD,
+                    "threshold":  config.SKILL_THRESHOLDS.get(skill, config.CONFIDENCE_THRESHOLD),
                 },
             )
 
-        # Step 3: dispatch to the skill-matched cloud LLM
-        cloud    = await _router.skill_router.dispatch(req.query, skill, req.system, req.messages)
+        # Step 3: dispatch to the skill-matched cloud LLM (with fallback chain)
+        cloud    = await _router.skill_router.dispatch(
+            req.query, skill, req.system, req.messages,
+            local_answer=local_answer,
+            confidence=local_confidence,
+        )
         total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
         tokens   = TokenBreakdown(
             input=cloud.input_tokens,
             output=cloud.output_tokens,
             total=cloud.input_tokens + cloud.output_tokens,
         )
+        status = "fallback" if cloud.provider == "error" else "success"
         _stats.record({
             "ts":               datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             "session_id":       req.session_id,
@@ -278,6 +713,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
             "latency_ms":       total_ms,
             "confidence_score": local_confidence,
             "tokens":           tokens.model_dump(),
+            "status":           status,
         })
         _log.info(
             "routed",
@@ -291,6 +727,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
                 "total_latency_ms": total_ms,
                 "tokens":           tokens.model_dump(),
                 "forced_cloud":     req.force_cloud,
+                "status":           status,
             },
         )
         return QueryResponse(
@@ -305,14 +742,97 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
         )
 
     except httpx.HTTPError as exc:
+        # Local Ollama unreachable
         _log.error("upstream_error", extra={"req_id": req_id, "error": str(exc)}, exc_info=True)
-        raise HTTPException(status_code=502, detail=f"Upstream LLM error: {exc}") from exc
+        total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
+        _stats.record({
+            "ts":       datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "session_id": req.session_id,
+            "source":   "error",
+            "skill":    skill,
+            "latency_ms": total_ms,
+            "status":   "error",
+        })
+        return JSONResponse(
+            status_code=200,
+            content={
+                "answer": "I encountered an issue reaching the local model. Please try again.",
+                "source": "error",
+                "model_used": "none",
+                "skill": skill,
+                "latency_ms": total_ms,
+                "confidence_score": None,
+                "tokens": {"input": 0, "output": 0, "total": 0},
+                "session_id": req.session_id,
+            },
+        )
     except ValueError as exc:
         _log.error("bad_request", extra={"req_id": req_id, "error": str(exc)})
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         _log.exception("internal_error", extra={"req_id": req_id})
-        raise HTTPException(status_code=500, detail="Internal server error") from exc
+        total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
+        _stats.record({
+            "ts":       datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "session_id": req.session_id,
+            "source":   "error",
+            "skill":    skill,
+            "latency_ms": total_ms,
+            "status":   "error",
+        })
+        return JSONResponse(
+            status_code=200,
+            content={
+                "answer": "Sorry, I ran into an issue processing that request. Please try again.",
+                "source": "error",
+                "model_used": "none",
+                "skill": skill,
+                "latency_ms": total_ms,
+                "confidence_score": None,
+                "tokens": {"input": 0, "output": 0, "total": 0},
+                "session_id": req.session_id,
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# POST /query/stream
+# ---------------------------------------------------------------------------
+
+@app.post("/query/stream")
+async def query_stream_endpoint(req: QueryRequest):
+    """Stream local Ollama tokens as Server-Sent Events."""
+    req_id = uuid.uuid4().hex[:8]
+    skill = _router.skill_router.classify(req.query)
+
+    _log.info(
+        "stream_query_received",
+        extra={
+            "req_id":        req_id,
+            "session_id":    req.session_id,
+            "query_preview": req.query[:120],
+            "skill":         skill,
+        },
+    )
+
+    async def event_stream():
+        try:
+            async for chunk in local_llm.generate_stream(
+                req.query, req.system, req.messages, skill=skill
+            ):
+                yield chunk
+        except Exception as exc:
+            _log.error("stream_error req_id=%s error=%s", req_id, exc)
+            yield f"data: {json.dumps({'error': True, 'message': str(exc)[:200], 'provider': 'ollama', 'done': True})}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +843,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
 async def health() -> dict:
     ollama_ok = False
     ollama_version: str | None = None
+    ollama_model: str = "Unavailable"
 
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
@@ -330,6 +851,10 @@ async def health() -> dict:
             r.raise_for_status()
             ollama_ok = True
             ollama_version = r.json().get("version")
+            tags = await client.get(f"{config.OLLAMA_BASE_URL}/api/tags")
+            tags.raise_for_status()
+            models = tags.json().get("models", [])
+            ollama_model = models[0]["name"] if models else "No model loaded"
     except Exception as exc:
         _log.warning("health_check_ollama_fail", extra={"error": str(exc)})
 
@@ -338,7 +863,7 @@ async def health() -> dict:
         "ollama": {
             "reachable": ollama_ok,
             "url":       config.OLLAMA_BASE_URL,
-            "model":     config.OLLAMA_MODEL,
+            "model":     ollama_model,
             "version":   ollama_version,
         },
         "cloud_apis_configured": {
@@ -361,6 +886,254 @@ async def stats() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# GET /billing
+# ---------------------------------------------------------------------------
+
+@app.get("/billing")
+async def billing_endpoint() -> dict:
+    """Check each cloud provider with a 1-token probe. Results cached 5 minutes."""
+    providers = ["claude", "gemini", "openai", "grok"]
+    results = await asyncio.gather(*[_get_billing_status(p) for p in providers])
+    return {
+        p: {
+            "status":       r["status"],
+            "checked_at":   r["checked_at"],
+            **(({"error_detail": r["error_detail"]}) if r.get("error_detail") else {}),
+        }
+        for p, r in zip(providers, results)
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /providers/status  — lightweight model-list checks, no tokens burned
+# ---------------------------------------------------------------------------
+
+_PROVIDERS_TTL: float = 300.0  # 5-minute cache
+_providers_cache: dict[str, Any] = {}
+
+
+async def _probe_ollama(client: httpx.AsyncClient) -> dict:
+    t0 = time.perf_counter()
+    try:
+        r = await client.get(f"{config.OLLAMA_BASE_URL}/api/tags", timeout=5.0)
+        lat = round((time.perf_counter() - t0) * 1000, 1)
+        r.raise_for_status()
+        models = [m["name"] for m in r.json().get("models", [])]
+        return {
+            "status": "online",
+            "model": config.OLLAMA_MODEL,
+            "credits": "Local / Unlimited",
+            "detail": ", ".join(models) if models else config.OLLAMA_MODEL,
+            "models_available": models,
+            "latency_ms": lat,
+        }
+    except Exception as exc:
+        return {
+            "status": "offline",
+            "model": config.OLLAMA_MODEL,
+            "credits": "N/A",
+            "detail": str(exc)[:80],
+            "models_available": [],
+            "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+        }
+
+
+async def _probe_anthropic(client: httpx.AsyncClient) -> dict:
+    t0 = time.perf_counter()
+    if not config.ANTHROPIC_API_KEY:
+        return {"status": "unconfigured", "model": config.CLAUDE_MODEL, "credits": "No API key", "detail": "", "latency_ms": 0}
+    try:
+        r = await client.get(
+            "https://api.anthropic.com/v1/models",
+            headers={"x-api-key": config.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"},
+            timeout=8.0,
+        )
+        lat = round((time.perf_counter() - t0) * 1000, 1)
+        if r.status_code == 200:
+            return {"status": "online", "model": config.CLAUDE_MODEL, "credits": "API Key: Active", "detail": "", "latency_ms": lat}
+        elif r.status_code in (401, 403):
+            return {"status": "offline", "model": config.CLAUDE_MODEL, "credits": "API Key: Invalid", "detail": f"HTTP {r.status_code}", "latency_ms": lat}
+        elif r.status_code == 429:
+            return {"status": "degraded", "model": config.CLAUDE_MODEL, "credits": "Rate Limited", "detail": "HTTP 429", "latency_ms": lat}
+        else:
+            return {"status": "degraded", "model": config.CLAUDE_MODEL, "credits": f"HTTP {r.status_code}", "detail": r.text[:80], "latency_ms": lat}
+    except Exception as exc:
+        return {"status": "offline", "model": config.CLAUDE_MODEL, "credits": "Connection Error", "detail": str(exc)[:80], "latency_ms": round((time.perf_counter() - t0) * 1000, 1)}
+
+
+async def _probe_gemini(client: httpx.AsyncClient) -> dict:
+    t0 = time.perf_counter()
+    if not config.GOOGLE_API_KEY:
+        return {"status": "unconfigured", "model": config.GEMINI_MODEL, "credits": "No API key", "detail": "", "latency_ms": 0}
+    try:
+        r = await client.get(
+            f"https://generativelanguage.googleapis.com/v1/models?key={config.GOOGLE_API_KEY}",
+            timeout=8.0,
+        )
+        lat = round((time.perf_counter() - t0) * 1000, 1)
+        if r.status_code == 200:
+            return {"status": "online", "model": config.GEMINI_MODEL, "credits": "API Key: Active", "detail": "", "latency_ms": lat}
+        else:
+            try:
+                body = r.json()
+                msg = body.get("error", {}).get("message", "Unknown error")
+            except Exception:
+                msg = r.text[:100]
+            if r.status_code in (400, 401, 403):
+                credits = "API Key: Invalid"
+                status = "offline"
+            elif r.status_code == 429:
+                credits = "Rate Limited"
+                status = "degraded"
+            else:
+                credits = f"HTTP {r.status_code}"
+                status = "degraded"
+            return {"status": status, "model": config.GEMINI_MODEL, "credits": credits, "detail": f"{r.status_code}: {msg}", "error_code": r.status_code, "error_detail": msg, "latency_ms": lat}
+    except Exception as exc:
+        return {"status": "offline", "model": config.GEMINI_MODEL, "credits": "Connection Error", "detail": str(exc)[:80], "latency_ms": round((time.perf_counter() - t0) * 1000, 1)}
+
+
+async def _probe_grok(client: httpx.AsyncClient) -> dict:
+    t0 = time.perf_counter()
+    if not config.XAI_API_KEY:
+        return {"status": "unconfigured", "model": config.GROK_MODEL, "credits": "No API key", "detail": "", "latency_ms": 0}
+    try:
+        r = await client.get(
+            "https://api.x.ai/v1/models",
+            headers={"Authorization": f"Bearer {config.XAI_API_KEY}"},
+            timeout=8.0,
+        )
+        lat = round((time.perf_counter() - t0) * 1000, 1)
+        if r.status_code == 200:
+            return {"status": "online", "model": config.GROK_MODEL, "credits": "API Key: Active", "detail": "", "latency_ms": lat}
+        elif r.status_code in (401, 403):
+            return {"status": "offline", "model": config.GROK_MODEL, "credits": "API Key: Invalid", "detail": f"HTTP {r.status_code}", "latency_ms": lat}
+        elif r.status_code == 429:
+            return {"status": "degraded", "model": config.GROK_MODEL, "credits": "Rate Limited", "detail": "HTTP 429", "latency_ms": lat}
+        else:
+            return {"status": "degraded", "model": config.GROK_MODEL, "credits": f"HTTP {r.status_code}", "detail": r.text[:80], "latency_ms": lat}
+    except Exception as exc:
+        return {"status": "offline", "model": config.GROK_MODEL, "credits": "Connection Error", "detail": str(exc)[:80], "latency_ms": round((time.perf_counter() - t0) * 1000, 1)}
+
+
+async def _probe_openai(client: httpx.AsyncClient) -> dict:
+    t0 = time.perf_counter()
+    if not config.OPENAI_API_KEY:
+        return {"status": "unconfigured", "model": config.OPENAI_MODEL, "credits": "No API key", "detail": "", "latency_ms": 0}
+    try:
+        r = await client.get(
+            "https://api.openai.com/v1/models",
+            headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
+            timeout=8.0,
+        )
+        lat = round((time.perf_counter() - t0) * 1000, 1)
+        if r.status_code == 200:
+            credits = "API Key: Active"
+            try:
+                rb = await client.get(
+                    "https://api.openai.com/v1/dashboard/billing/credit_grants",
+                    headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
+                    timeout=5.0,
+                )
+                if rb.status_code == 200:
+                    bd = rb.json()
+                    granted = float(bd.get("total_granted") or 0)
+                    used    = float(bd.get("total_used")    or 0)
+                    credits = f"${granted - used:.2f} remaining"
+            except Exception:
+                pass
+            return {"status": "online", "model": config.OPENAI_MODEL, "credits": credits, "detail": "", "latency_ms": lat}
+        elif r.status_code in (401, 403):
+            return {"status": "offline", "model": config.OPENAI_MODEL, "credits": "API Key: Invalid", "detail": f"HTTP {r.status_code}", "latency_ms": lat}
+        elif r.status_code == 429:
+            return {"status": "degraded", "model": config.OPENAI_MODEL, "credits": "Rate Limited", "detail": "HTTP 429", "latency_ms": lat}
+        else:
+            return {"status": "degraded", "model": config.OPENAI_MODEL, "credits": f"HTTP {r.status_code}", "detail": r.text[:80], "latency_ms": lat}
+    except Exception as exc:
+        return {"status": "offline", "model": config.OPENAI_MODEL, "credits": "Connection Error", "detail": str(exc)[:80], "latency_ms": round((time.perf_counter() - t0) * 1000, 1)}
+
+
+@app.get("/providers/status")
+async def providers_status_endpoint() -> dict:
+    """Check all provider connectivity with model-list endpoints. Cached 5 minutes."""
+    now = time.time()
+    cached = _providers_cache.get("data")
+    if cached and now < cached.get("_expires", 0):
+        return {k: v for k, v in cached.items() if k != "_expires"}
+
+    checked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    async with httpx.AsyncClient() as client:
+        ollama_r, claude_r, gemini_r, grok_r, openai_r = await asyncio.gather(
+            _probe_ollama(client),
+            _probe_anthropic(client),
+            _probe_gemini(client),
+            _probe_grok(client),
+            _probe_openai(client),
+        )
+
+    # Overlay router degraded state so the UI reflects actual routing health
+    for name, res in [("claude", claude_r), ("gemini", gemini_r), ("grok", grok_r), ("openai", openai_r)]:
+        if res["status"] == "online" and _router._is_degraded(name):
+            expiry = _router._degraded.get(name, 0)
+            res["status"] = "degraded"
+            res["degraded_until"] = datetime.fromtimestamp(expiry, tz=timezone.utc).isoformat(timespec="seconds")
+
+    response: dict[str, Any] = {
+        "providers": {
+            "ollama": {"name": "Ollama", "emoji": "🟠", "checked_at": checked_at, **ollama_r},
+            "claude": {"name": "Claude", "emoji": "🟣", "checked_at": checked_at, **claude_r},
+            "gemini": {"name": "Gemini", "emoji": "🔵", "checked_at": checked_at, **gemini_r},
+            "grok":   {"name": "Grok",   "emoji": "🟡", "checked_at": checked_at, **grok_r},
+            "openai": {"name": "OpenAI", "emoji": "🟢", "checked_at": checked_at, **openai_r},
+        },
+        "checked_at": checked_at,
+    }
+    _providers_cache["data"] = {**response, "_expires": now + _PROVIDERS_TTL}
+    _log.info(
+        "providers_status_checked",
+        extra={"statuses": {k: v["status"] for k, v in response["providers"].items()}},
+    )
+    return response
+
+
+# ---------------------------------------------------------------------------
+# GET /metrics/history
+# ---------------------------------------------------------------------------
+
+@app.get("/metrics/history")
+async def metrics_history(days: int = 5) -> dict:
+    """Return system_metrics rows for the past N days, ordered ASC."""
+    def _query() -> list:
+        if not os.path.exists(_METRICS_DB):
+            return []
+        con = sqlite3.connect(_METRICS_DB)
+        rows = con.execute(
+            """SELECT timestamp, cpu_pct, gpu_pct, ram_used_mb, ram_total_mb
+               FROM system_metrics
+               WHERE timestamp > datetime('now', ? || ' days')
+               ORDER BY timestamp ASC""",
+            (f"-{days}",),
+        ).fetchall()
+        con.close()
+        return rows
+
+    loop = asyncio.get_event_loop()
+    rows = await loop.run_in_executor(None, _query)
+    return {
+        "metrics": [
+            {
+                "timestamp":    r[0],
+                "cpu_pct":      r[1],
+                "gpu_pct":      r[2],
+                "ram_used_mb":  r[3],
+                "ram_total_mb": r[4],
+            }
+            for r in rows
+        ]
+    }
+
+
+# ---------------------------------------------------------------------------
 # GET /storage
 # ---------------------------------------------------------------------------
 
@@ -379,10 +1152,7 @@ async def storage_endpoint() -> dict:
         except Exception:
             return None
 
-    # microSD — host root fs mounted read-only at /host_root
     sd = _disk("/host_root") or {"total_gb": 468.0, "used_gb": 42.0, "free_gb": 407.0}
-
-    # NVMe — host /mnt mounted read-only at /host_mnt
     nv = _disk("/host_mnt") or {"total_gb": 1800.0, "used_gb": 28.0, "free_gb": 1772.0}
 
     return {
@@ -409,3 +1179,85 @@ async def memory_endpoint() -> dict:
         }
     except Exception:
         return {"total_gb": 7.4, "used_gb": 1.7, "available_gb": 3.7, "cached_gb": 2.0}
+
+
+# ---------------------------------------------------------------------------
+# GET /jetson/containers
+# ---------------------------------------------------------------------------
+
+_CONTAINERS_KEY = os.getenv("EDGE_CONTAINERS_KEY", "")
+
+
+@app.get("/jetson/containers")
+async def jetson_containers(request: Request) -> JSONResponse:
+    """List Docker containers. Requires X-Edge-Key header when EDGE_CONTAINERS_KEY is set."""
+    if _CONTAINERS_KEY:
+        provided = request.headers.get("x-edge-key", "")
+        if provided != _CONTAINERS_KEY:
+            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(uds="/var/run/docker.sock"),
+            timeout=10.0,
+        ) as client:
+            resp = await client.get("http://docker/v1.41/containers/json", params={"all": "true"})
+            resp.raise_for_status()
+            raw: list[dict] = resp.json()
+        result = []
+        for c in raw:
+            name   = (c.get("Names") or ["/unknown"])[0].lstrip("/")
+            image  = c.get("Image", "")
+            status = c.get("Status", "")
+            running = status.lower().startswith("up")
+            port_parts: list[str] = []
+            for p in (c.get("Ports") or []):
+                pub  = p.get("PublicPort")
+                priv = p.get("PrivatePort")
+                if pub and priv:
+                    port_parts.append(f"{pub}→{priv}" if pub != priv else str(priv))
+                elif priv:
+                    port_parts.append(str(priv))
+            result.append({
+                "name":    name,
+                "image":   image,
+                "status":  status,
+                "running": running,
+                "ports":   ", ".join(dict.fromkeys(port_parts)) or "—",
+            })
+        result.sort(key=lambda x: (not x["running"], x["name"].lower()))
+        return JSONResponse(content=result)
+    except Exception as exc:
+        _log.error("jetson_containers: %s", exc)
+        return JSONResponse(status_code=503, content={"error": f"Docker unavailable: {exc}"})
+
+
+# ---------------------------------------------------------------------------
+# Argus reverse proxy — routes /argus/* → http://127.0.0.1:8400/*
+# The dedicated argus-api.pazlabs.io tunnel is not running (missing credentials).
+# Proxying through the existing api.pazlabs.io tunnel is the workaround.
+# ---------------------------------------------------------------------------
+
+_HOP_BY_HOP = frozenset({"host", "content-length", "transfer-encoding", "connection"})
+
+
+@app.api_route("/argus/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def argus_proxy(path: str, request: Request) -> Response:
+    fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            r = await client.request(
+                method=request.method,
+                url=f"http://host.docker.internal:8400/{path}",
+                params=dict(request.query_params),
+                headers=fwd_headers,
+                content=await request.body(),
+            )
+        return Response(
+            content=r.content,
+            status_code=r.status_code,
+            media_type=r.headers.get("content-type", "application/json"),
+        )
+    except httpx.ConnectError:
+        return JSONResponse(status_code=503, content={"error": "Argus backend unreachable"})
+    except httpx.TimeoutException:
+        return JSONResponse(status_code=504, content={"error": "Argus backend timeout"})

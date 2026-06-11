@@ -5,6 +5,7 @@ services:
   ollama:
     image: ollama/ollama:latest
     container_name: ollama
+    runtime: nvidia
     ports:
       - "11434:11434"
     restart: unless-stopped
@@ -17,6 +18,7 @@ services:
       OLLAMA_FLASH_ATTENTION: 1
       OLLAMA_KV_CACHE_TYPE: q4_0
       OLLAMA_KEEP_ALIVE: 1h
+      OLLAMA_GPU_LAYERS: "999"
     volumes:
       - /mnt/models/ollama:/models
       - /mnt/logs/ollama:/logs
@@ -50,7 +52,7 @@ services:
       # Alternative: set OLLAMA_BASE_URL=http://ollama:11434 in .env after
       # deploy.sh has connected the ollama container to edge-net.
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
-      OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-4096}
+      OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-512}
 
       # Prevent .pyc writes into the read-only layer
       PYTHONDONTWRITEBYTECODE: "1"
@@ -68,6 +70,8 @@ services:
     volumes:
       - /:/host_root:ro
       - /mnt:/host_mnt:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /home/jeffpaz/edge-router/data:/app/data
 
     depends_on:
       - ollama

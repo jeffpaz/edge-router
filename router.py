@@ -1,5 +1,6 @@
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -17,6 +18,51 @@ _log = logging.getLogger("edge_router.router")
 
 
 # ---------------------------------------------------------------------------
+# Degraded-provider tracking
+# ---------------------------------------------------------------------------
+
+_DEGRADED_TTL: float = 1800.0  # 30 minutes
+_degraded: dict[str, float] = {}  # provider → wall-clock expiry (time.time())
+
+
+def _is_billing_error(exc: cloud_llms.ProviderError) -> bool:
+    """Return True for quota/billing/permission errors — warrants degrading the provider."""
+    if exc.error_type == "rate_limit":
+        return True
+    if exc.error_type == "api_status_error":
+        if exc.status_code in (429, 402, 403):
+            return True
+        if exc.status_code == 400:
+            msg = str(exc).lower()
+            return any(w in msg for w in ("credit", "billing", "quota", "payment", "balance"))
+    return False
+
+
+def _is_degraded(provider: str) -> bool:
+    expiry = _degraded.get(provider)
+    if expiry is None:
+        return False
+    if time.time() < expiry:
+        return True
+    del _degraded[provider]  # TTL expired — clean up silently
+    return False
+
+
+def _mark_degraded(provider: str) -> None:
+    expiry = time.time() + _DEGRADED_TTL
+    _degraded[provider] = expiry
+    _log.warning(
+        "provider_degraded provider=%s until=%s",
+        provider,
+        datetime.fromtimestamp(expiry, tz=timezone.utc).isoformat(timespec="seconds"),
+        extra={
+            "provider": provider,
+            "degraded_until": datetime.fromtimestamp(expiry, tz=timezone.utc).isoformat(timespec="seconds"),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # SkillRouter
 # ---------------------------------------------------------------------------
 
@@ -26,7 +72,7 @@ class SkillRouter:
     Skill priority on ties (same match count): coding > math_data > current_events.
     """
 
-    # Evaluated in order; first skill to outscore the rest wins ties.
+    # Evaluated in order; first skill to outscore the rest wins ties naturally.
     _PATTERNS: list[tuple[str, list[str]]] = [
         ("coding", [
             r"\bcode\b",       r"\bdebug\b",      r"\bfunction\b",   r"\berror\b",
@@ -42,27 +88,94 @@ class SkillRouter:
             r"\bvariance\b",   r"\bregression\b",  r"\bprobability\b",r"\bequation\b",
             r"\bsolve\b",      r"\bintegral\b",    r"\bderivative\b", r"\bmatrix\b",
             r"\bchart\b",      r"\bplot\b",        r"\bcorrelation\b",r"\bstd\b",
+            # Data / statistics signals — queries that need real numbers, not guesses
+            r"\bpercent\b",    r"\bpercentage\b",  r"\d+\s*%",        r"\bhow many\b",
+            r"\bhow much\b",   r"\bstatistic\b",   r"\bdata\b",       r"\bstudy\b",
+            r"\bresearch\b",   r"\bsurvey\b",      r"\bdistribution\b",r"\bodds\b",
+            r"\bratio\b",      r"\bproportion\b",  r"\bfraction\b",   r"\bhow often\b",
+            r"\bhow frequently\b", r"\bwhat fraction\b", r"\bwhat share\b",
+            r"\bpopulation\b", r"\bsample\b",      r"\bestimate\b",   r"\bapproximately how\b",
         ]),
         ("current_events", [
             r"\btoday\b",      r"\bnews\b",        r"\blatest\b",     r"\b202[4-9]\b",
             r"\bwho won\b",    r"\bbreaking\b",    r"\brecently\b",   r"\bcurrently\b",
             r"\bupdate\b",     r"\belection\b",    r"\bannounced\b",  r"\breleased\b",
             r"\bhappened\b",   r"\bright now\b",   r"\bthis week\b",  r"\bthis month\b",
+            r"\bnet worth\b",  r"\bbiography\b",   r"\bfounded\b",    r"\bceo\b",
+            r"how did \S+ make", r"who is [A-Z]",
+        ]),
+        ("sports_people", [
+            r"\bnhl\b",        r"\bnba\b",         r"\bnfl\b",        r"\bmlb\b",
+            r"\bnascar\b",     r"\bpga\b",         r"\bfifa\b",       r"\bufc\b",
+            r"\bhockey\b",     r"\bbasketball\b",  r"\bfootball\b",   r"\bbaseball\b",
+            r"\bsoccer\b",     r"\bgolf\b",        r"\btennis\b",
+            r"\bteam\b",       r"\bplayer\b",      r"\bcoach\b",      r"\bfranchise\b",
+            r"\bleague\b",     r"\broster\b",      r"\bstandings\b",  r"\bchampionship\b",
+            r"\bplayoffs\b",   r"\bseason\b",      r"\bdrafted\b",    r"\btraded\b",
+            r"\bsigned\b",
+            r"\bwho owns\b",   r"\bwho plays\b",   r"\bwho played\b",
+            r"\bwhich team\b", r"\bwhat team\b",
+        ]),
+        ("opinion_advice", [
+            r"\bwhich is better\b", r"\bwhat do you think\b", r"\bpros and cons\b",
+            r"\brecommend\b",       r"\badvice\b",          r"\bopinion\b",
+            r"\bworth it\b",        r"\bcompare\b",         r"\bversus\b",
+            r"\bvs\b",              r"\bdifference between\b",
+        ]),
+        ("definition", [
+            r"\bwhat is\b",         r"\bwhat are\b",       r"\bexplain\b",
+            r"\bdefine\b",          r"\bmeaning of\b",     r"\bwhat does\b",
+            r"\bdescribe\b",        r"\btell me about\b",  r"\boverview of\b",
+        ]),
+        ("creative", [
+            r"\bwrite me\b",        r"\bdraft\b",          r"\bbrainstorm\b",
+            r"\bstory\b",           r"\bpoem\b",           r"\bcreative\b",
+            r"\bimagine\b",         r"\bcome up with\b",   r"\bgenerate\b",
+        ]),
+        ("how_to", [
+            r"how do i\b",          r"\bhow to\b",          r"\bsteps to\b",
+            r"\bstep by step\b",    r"\binstructions for\b",r"\bguide me\b",
+            r"\bwalk me through\b", r"\bhow should i\b",    r"\bwhat is the best way to\b",
+        ]),
+        ("language_task", [
+            r"\bsummarize\b",       r"\brewrite\b",        r"\btranslate\b",
+            r"\bfix grammar\b",     r"\brephrase\b",       r"\bsimplify\b",
+            r"\bmake this shorter\b",r"\bedit this\b",     r"\bimprove this\b",
+            r"\bclean up\b",        r"\bproofread\b",
+        ]),
+        ("conversational", [
+            r"\brecipe\b",      r"\bcook\b",        r"\bfood\b",        r"\bmake\b",
+            r"how do i\b",      r"what should i\b", r"\bhelp me\b",     r"\bidea\b",
+            r"\bsuggest\b",     r"\btips\b",        r"\beasy\b",        r"\bsimple\b",
+            r"\bbetter\b",      r"\bbest way\b",    r"\bwhat can\b",    r"should i\b",
+            r"\bcan i\b",
         ]),
     ]
 
+    # Skills that are always answered locally — cloud escalation is never attempted.
+    # Evaluated after classification; log as "local-only skill — no escalation".
+    LOCAL_ONLY_SKILLS: frozenset[str] = frozenset({
+        "conversational",
+        "definition",
+        "creative",
+        "how_to",
+        "opinion_advice",
+        "language_task",
+    })
+
     # Skill → (cloud_llms provider key, model ID)
+    # Local-only skills are intentionally absent — they never reach cloud dispatch.
     _SKILL_MAP: dict[str, tuple[str, str]] = {
         "coding":         ("claude", "claude-sonnet-4-20250514"),
-        "math_data":      ("gemini", "gemini-1.5-pro"),
-        "current_events": ("grok",   "grok-2-latest"),
+        "math_data":      ("gemini", "gemini-2.0-flash"),
+        "current_events":  ("grok",   None),
+        "sports_people":   ("grok",   None),
         "general":        ("openai", "gpt-4o"),
     }
 
     def classify(self, prompt: str) -> str:
         """Return the skill label that best matches prompt, or 'general'."""
         text = prompt.lower()
-        # Score each non-general skill; first in _PATTERNS wins ties naturally.
         scores: dict[str, int] = {
             skill: sum(1 for pat in patterns if re.search(pat, text))
             for skill, patterns in self._PATTERNS
@@ -76,24 +189,136 @@ class SkillRouter:
         skill: str,
         system: str = "",
         messages: list = [],
+        local_answer: str | None = None,
+        confidence: float | None = None,
     ) -> cloud_llms.CloudResponse:
-        """Call the cloud LLM mapped to skill and log the routing decision."""
+        """Call the cloud LLM mapped to skill with fallback chain on error.
+
+        Skips providers that are in the degraded set (quota/billing failures).
+        Falls back: primary → openai → claude → grok → graceful message.
+        Never raises; always returns a CloudResponse.
+        """
         provider, model = self._SKILL_MAP.get(skill, self._SKILL_MAP["general"])
 
+        conf_str = f"{confidence:.2f}" if confidence is not None else "n/a"
         _log.info(
-            "timestamp=%s skill=%s provider=%s model=%s query=%.80r",
-            datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            skill,
+            "Routing to %s — skill=%s confidence=%s query_preview=%.50s",
             provider,
-            model,
+            skill,
+            conf_str,
             query,
+            extra={
+                "provider": provider,
+                "model": model,
+                "skill": skill,
+                "confidence": confidence,
+                "query_preview": query[:50],
+                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            },
         )
 
-        return await cloud_llms.query(provider, query, system, model=model, messages=messages)
+        # Build fallback chain: primary first, then others (skipping duplicates)
+        fallback_chain: list[tuple[str, str | None]] = [(provider, model)]
+        for fallback_provider in ("openai", "claude", "grok"):
+            if fallback_provider != provider:
+                fallback_chain.append((fallback_provider, None))
+
+        last_exc: Exception | None = None
+        for attempt_provider, attempt_model in fallback_chain:
+            # Skip providers known to be in a quota/billing failure window
+            if _is_degraded(attempt_provider):
+                expiry = _degraded.get(attempt_provider, 0)
+                _log.info(
+                    "Skipping %s — marked degraded until %s",
+                    attempt_provider,
+                    datetime.fromtimestamp(expiry, tz=timezone.utc).isoformat(timespec="seconds"),
+                    extra={
+                        "provider": attempt_provider,
+                        "degraded_until": datetime.fromtimestamp(expiry, tz=timezone.utc).isoformat(timespec="seconds"),
+                    },
+                )
+                continue
+
+            try:
+                return await cloud_llms.query(
+                    attempt_provider, query, system, model=attempt_model, messages=messages
+                )
+            except cloud_llms.ProviderError as exc:
+                if _is_billing_error(exc):
+                    _mark_degraded(attempt_provider)
+                _log.error(
+                    "provider_failed provider=%s error_type=%s trying_next_fallback",
+                    attempt_provider,
+                    exc.error_type,
+                    extra={
+                        "provider": attempt_provider,
+                        "error_type": exc.error_type,
+                        "status_code": exc.status_code,
+                        "error": str(exc),
+                    },
+                    exc_info=True,
+                )
+                last_exc = exc
+
+        # All providers exhausted — return graceful message
+        _log.error(
+            "all_providers_failed skill=%s last_error=%s",
+            skill,
+            last_exc,
+            extra={"skill": skill, "fallback_chain": [p for p, _ in fallback_chain]},
+        )
+        if local_answer is not None:
+            msg = (
+                "I encountered an issue reaching that service. "
+                f"Here's what I know locally: {local_answer}"
+            )
+        else:
+            msg = "Sorry, I ran into an issue reaching all available services. Please try again."
+        return cloud_llms.CloudResponse(
+            answer=msg,
+            provider="error",
+            model="none",
+            latency_ms=0.0,
+            input_tokens=0,
+            output_tokens=0,
+        )
 
 
 # Module-level singleton — import and call directly if needed.
 skill_router = SkillRouter()
+
+# Convenient module-level alias so main.py can reference without going through the class.
+LOCAL_ONLY_SKILLS: frozenset[str] = SkillRouter.LOCAL_ONLY_SKILLS
+
+
+# ---------------------------------------------------------------------------
+# Local-first retry helper
+# ---------------------------------------------------------------------------
+
+_FILLER_RE = re.compile(
+    r"\b(?:please|could you|can you|i was wondering|i'?d like to know|would you mind)\b",
+    re.IGNORECASE,
+)
+
+
+def _simplify_query(query: str) -> str:
+    """Strip filler phrases and trim queries over 20 words to their core clause."""
+    simplified = _FILLER_RE.sub("", query).strip()
+    simplified = re.sub(r"\s{2,}", " ", simplified)
+    words = simplified.split()
+    if len(words) > 20:
+        last_comma = simplified.rfind(",")
+        if last_comma != -1:
+            candidate = simplified[last_comma + 1:].strip()
+            if candidate:
+                simplified = candidate
+        else:
+            last_period = simplified.rfind(".")
+            if last_period != -1 and last_period < len(simplified) - 1:
+                candidate = simplified[last_period + 1:].strip()
+                if candidate:
+                    simplified = candidate
+    return simplified or query
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +328,7 @@ skill_router = SkillRouter()
 @dataclass
 class RouterResponse:
     answer: str
-    source: str          # "local" | cloud provider name
+    source: str          # "local" | cloud provider name | "error"
     model: str
     skill: str
     local_confidence: float
@@ -121,19 +346,12 @@ async def route(
     system: str = "",
     force_provider: str | None = None,
 ) -> RouterResponse:
-    """Try local LLM first; escalate via SkillRouter when confidence is low.
-
-    Args:
-        prompt:         User query.
-        system:         Optional system prompt forwarded to whichever LLM answers.
-        force_provider: Bypass routing — send directly to "local", "claude",
-                        "gemini", "grok", or "openai" (uses global config model).
-    """
+    """Try local LLM first; escalate via SkillRouter when confidence is low."""
     skill = skill_router.classify(prompt)
 
     # ── Forced provider ──────────────────────────────────────────────────────
     if force_provider == "local":
-        local = await local_llm.query(prompt, system)
+        local = await local_llm.query(prompt, system, skill=skill)
         return RouterResponse(
             answer=local["answer"],
             source="local",
@@ -146,8 +364,31 @@ async def route(
         )
 
     if force_provider in ("claude", "gemini", "grok", "openai"):
-        # Uses global config model, not skill-specific model.
-        cloud = await cloud_llms.query(force_provider, prompt, system)
+        try:
+            cloud = await cloud_llms.query(force_provider, prompt, system)
+        except cloud_llms.ProviderError as exc:
+            if _is_billing_error(exc):
+                _mark_degraded(force_provider)
+            _log.error(
+                "forced_provider_failed provider=%s error=%s",
+                force_provider,
+                exc,
+                extra={"provider": force_provider, "error_type": exc.error_type},
+                exc_info=True,
+            )
+            return RouterResponse(
+                answer=(
+                    "I encountered an issue reaching that service. "
+                    "Please try again or use a different provider."
+                ),
+                source="error",
+                model="none",
+                skill=skill,
+                local_confidence=-1.0,
+                tokens_used=0,
+                latency_ms=0.0,
+                metadata={"forced": True, "error": str(exc)},
+            )
         return RouterResponse(
             answer=cloud.answer,
             source=cloud.provider,
@@ -160,7 +401,37 @@ async def route(
         )
 
     # ── Normal path: local first ─────────────────────────────────────────────
-    local = await local_llm.query(prompt, system)
+    local = await local_llm.query(prompt, system, skill=skill)
+
+    threshold = config.SKILL_THRESHOLDS.get(skill, config.CONFIDENCE_THRESHOLD)
+
+    # Local-only skills — always return local answer, never escalate
+    if skill in LOCAL_ONLY_SKILLS:
+        _log.info(
+            "local-only skill — no escalation skill=%s confidence=%.4f routed_to=ollama",
+            skill,
+            local["confidence"],
+            extra={
+                "skill": skill,
+                "routed_to": "ollama",
+                "confidence": local["confidence"],
+                "local_only": True,
+            },
+        )
+        return RouterResponse(
+            answer=local["answer"],
+            source="local",
+            model=local["model"],
+            skill=skill,
+            local_confidence=local["confidence"],
+            tokens_used=local["prompt_tokens"] + local["completion_tokens"],
+            latency_ms=-1,
+            metadata={
+                "routed_to": "ollama",
+                "local_only": True,
+                "signals": local["signals"],
+            },
+        )
 
     if not local["should_escalate"]:
         return RouterResponse(
@@ -172,13 +443,60 @@ async def route(
             tokens_used=local["prompt_tokens"] + local["completion_tokens"],
             latency_ms=-1,
             metadata={
-                "threshold": config.CONFIDENCE_THRESHOLD,
+                "threshold": threshold,
                 "signals": local["signals"],
             },
         )
 
+    # ── Local-first retry before cloud escalation (general and coding only) ──
+    if config.RETRY_ENABLED and skill in ("general", "coding"):
+        simplified = _simplify_query(prompt)
+        if simplified != prompt:
+            _log.info(
+                "local_retry_attempt skill=%s simplified_preview=%.60s",
+                skill,
+                simplified[:60],
+                extra={"skill": skill, "simplified_preview": simplified[:60]},
+            )
+            retry_local = await local_llm.query(simplified, system, skill=skill)
+            if not retry_local["should_escalate"]:
+                _log.info(
+                    "local retry succeeded — escalation avoided skill=%s confidence=%.4f",
+                    skill,
+                    retry_local["confidence"],
+                    extra={
+                        "skill": skill,
+                        "confidence": retry_local["confidence"],
+                        "threshold": threshold,
+                    },
+                )
+                return RouterResponse(
+                    answer=retry_local["answer"],
+                    source="local",
+                    model=retry_local["model"],
+                    skill=skill,
+                    local_confidence=retry_local["confidence"],
+                    tokens_used=retry_local["prompt_tokens"] + retry_local["completion_tokens"],
+                    latency_ms=-1,
+                    metadata={
+                        "threshold": threshold,
+                        "retry": True,
+                        "signals": retry_local["signals"],
+                    },
+                )
+            _log.info(
+                "local_retry_failed skill=%s confidence=%.4f — escalating",
+                skill,
+                retry_local["confidence"],
+                extra={"skill": skill, "confidence": retry_local["confidence"]},
+            )
+
     # ── Escalate: SkillRouter picks cloud LLM by skill ───────────────────────
-    cloud = await skill_router.dispatch(prompt, skill, system)
+    cloud = await skill_router.dispatch(
+        prompt, skill, system,
+        local_answer=local["answer"],
+        confidence=local["confidence"],
+    )
     local_tokens = local["prompt_tokens"] + local["completion_tokens"]
 
     return RouterResponse(
@@ -190,7 +508,7 @@ async def route(
         tokens_used=local_tokens + cloud.input_tokens + cloud.output_tokens,
         latency_ms=cloud.latency_ms,
         metadata={
-            "threshold": config.CONFIDENCE_THRESHOLD,
+            "threshold": threshold,
             "escalated": True,
             "local_model": local["model"],
             "signals": local["signals"],
