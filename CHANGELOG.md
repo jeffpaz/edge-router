@@ -4,6 +4,20 @@ All notable changes to edge-router are documented here.
 
 ---
 
+## 2026-06-12
+
+### Added
+- **`realtime_classifier.py`** — pre-LLM intent classifier. Detects real-time queries (sports scores, stock prices, breaking news, live events) using temporal signal matching, topic keywords, sports entity lists, and regex patterns. Returns `IntentResult(is_realtime, confidence, signals, preferred_provider)`.
+- **Realtime bypass in `/query`** — before running local Ollama, checks `classify_intent()`. If `is_realtime=True`, routes directly to `grok` (sports/scores) or `openai` (prices/news), bypassing local inference entirely. Response includes `realtime_intent: true` and `realtime_signals` list.
+- **Realtime bypass in `/query/stream`** — same intent check at stream start. If realtime, calls cloud LLM, then fake-streams the response 4 chars/chunk to maintain streaming UX. Done event metadata includes full routing fields.
+
+### Fixed
+- **Ollama streaming done-event metadata** — the SSE `done` event emitted by `local_llm.generate_stream()` was missing fields required by the frontend: `routed_to`, `source`, `model_used`, `latency_ms`, `confidence_score`, and `tokens: {input, output, total}`. All fields now included. `latency_ms` is measured with `time.monotonic()` from before the HTTP call to Ollama.
+- **`import time` added to `local_llm.py`** — was missing, required for `time.monotonic()` in the streaming path.
+
+
+---
+
 ## 2026-06-11
 
 ### Added

@@ -3,24 +3,39 @@
 Routes LLM queries to a **local Ollama model** first. If the response confidence falls below a configurable threshold, the query is automatically escalated to a cloud provider (Claude, Gemini, Grok, or OpenAI).
 
 ```
-POST /query
+POST /query  (or /query/stream)
+  │
+  ├─ realtime_classifier ──is_realtime──► cloud LLM (Grok/OpenAI) ──► return
   │
   ├─ local Ollama ──confidence OK──► return response
   │
-  └─ confidence low ──────────────► cloud LLM ──► return response
+  └─ confidence low ───────────────► cloud LLM ──► return response
 ```
 
 ## Project layout
 
 ```
 edge-router/
-├── main.py         FastAPI app, /query and /health endpoints
-├── router.py       Skill classifier + routing logic
-├── local_llm.py    Ollama client with confidence scoring
-├── cloud_llms.py   Clients for Claude, Gemini, Grok, OpenAI
-├── config.py       API keys and settings from environment variables
+├── main.py                FastAPI app, /query, /query/stream, /health endpoints
+├── router.py              Skill classifier + routing logic
+├── local_llm.py           Ollama client with confidence scoring and SSE streaming
+├── cloud_llms.py          Clients for Claude, Gemini, Grok, OpenAI
+├── realtime_classifier.py Real-time intent detector (sports/stocks/news bypass)
+├── config.py              API keys and settings from environment variables
 └── requirements.txt
 ```
+
+---
+
+
+## Realtime bypass
+
+Before sending a query to Ollama, `realtime_classifier.classify_intent()` checks whether the query requires live data (sports scores, stock prices, breaking news, live events). If it does, the local model is skipped and the query routes directly to:
+
+- **Grok** — sports scores, match results, sports entities
+- **OpenAI** — stock prices, financial data, breaking news
+
+The `/query` response includes `realtime_intent: true` and a `realtime_signals` list when this path is taken. The `/query/stream` endpoint applies the same check and fake-streams the cloud response to maintain streaming UX.
 
 ---
 
@@ -197,6 +212,33 @@ Response:
 | `latency_ms` | float | Total wall-clock time for the request |
 | `local_confidence` | float\|null | Confidence score from local model; null when `force_cloud=true` |
 | `tokens_used` | int | Total tokens consumed |
+
+
+### `POST /query/stream`
+
+Same request body as `/query`. Returns a Server-Sent Events (SSE) stream.
+
+Each event is `data: <json>`. Token chunks: `{"chunk": "Hello"}`
+
+Done event (final):
+
+```json
+{
+  "done": true,
+  "routed_to": "local",
+  "source": "local",
+  "model_used": "gemma2:2b",
+  "skill": "general",
+  "latency_ms": 1234,
+  "confidence_score": null,
+  "realtime_intent": false,
+  "tokens": { "input": 42, "output": 87, "total": 129 },
+  "prompt_tokens": 42,
+  "completion_tokens": 87
+}
+```
+
+For cloud-routed responses, `routed_to` is the provider name (e.g. `"claude"`, `"grok"`).
 
 ### `GET /health`
 

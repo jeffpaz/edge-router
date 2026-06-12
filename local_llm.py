@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import re
+import time
 
 import httpx
 
@@ -519,6 +520,7 @@ async def generate_stream(
         payload["system"] = system
 
     received_tokens = False
+    t_start = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             async with client.stream(
@@ -540,11 +542,24 @@ async def generate_stream(
                         if not received_tokens:
                             yield f"data: {json.dumps({'error': True, 'message': 'Ollama returned an empty response', 'provider': 'ollama', 'done': True})}\n\n"
                             return
+                        in_tok  = chunk.get("prompt_eval_count", 0)
+                        out_tok = chunk.get("eval_count", 0)
+                        lat_ms  = round((time.monotonic() - t_start) * 1000)
                         metadata = {
-                            "model":             config.OLLAMA_MODEL,
-                            "skill":             skill,
-                            "prompt_tokens":     chunk.get("prompt_eval_count", 0),
-                            "completion_tokens": chunk.get("eval_count", 0),
+                            "routed_to":        "local",
+                            "source":           "local",
+                            "model":            config.OLLAMA_MODEL,
+                            "model_used":       config.OLLAMA_MODEL,
+                            "skill":            skill,
+                            "confidence_score": None,
+                            "latency_ms":       lat_ms,
+                            "tokens": {
+                                "input":  in_tok,
+                                "output": out_tok,
+                                "total":  in_tok + out_tok,
+                            },
+                            "prompt_tokens":     in_tok,
+                            "completion_tokens": out_tok,
                         }
                         yield f"data: {json.dumps({'token': '', 'done': True, 'metadata': metadata})}\n\n"
                         asyncio.create_task(_send_keepalive())

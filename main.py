@@ -23,6 +23,7 @@ import cloud_llms
 import config
 import local_llm
 import router as _router
+from realtime_classifier import classify as classify_intent
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +447,9 @@ class QueryResponse(BaseModel):
     tokens: TokenBreakdown
     session_id: str | None
     cache_hit: bool = False
+    realtime_intent: bool = False
+    realtime_signals: list[str] = []
+    routing_reason: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +504,71 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
     local_answer: str | None = None
 
     try:
+        # ── Realtime intent bypass — skips local LLM for sports/news/price ──────
+        _rt = classify_intent(req.query)
+        _routing_reason: str | None = None
+        if _rt.is_realtime and not req.force_cloud:
+            preferred = _rt.preferred_provider
+            available = [p for p in ["grok", "openai", "claude"] if not _router._is_degraded(p)]
+            selected = preferred if preferred in available else (available[0] if available else None)
+            if selected:
+                _routing_reason = f"realtime_intent signals={_rt.signals}"
+                try:
+                    rt_cloud = await cloud_llms.query(selected, req.query, req.system, messages=req.messages)
+                    total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
+                    tokens   = TokenBreakdown(
+                        input=rt_cloud.input_tokens,
+                        output=rt_cloud.output_tokens,
+                        total=rt_cloud.input_tokens + rt_cloud.output_tokens,
+                    )
+                    _stats.record({
+                        "ts":               datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                        "session_id":       req.session_id,
+                        "source":           rt_cloud.provider,
+                        "model_used":       rt_cloud.model,
+                        "skill":            skill,
+                        "latency_ms":       total_ms,
+                        "confidence_score": None,
+                        "tokens":           tokens.model_dump(),
+                        "status":           "success",
+                        "realtime_intent":  True,
+                        "realtime_signals": _rt.signals,
+                        "routing_reason":   _routing_reason,
+                    })
+                    _log.info(
+                        "realtime_intent_routed provider=%s signals=%s",
+                        rt_cloud.provider, _rt.signals,
+                        extra={
+                            "req_id":         req_id,
+                            "provider":       rt_cloud.provider,
+                            "skill":          skill,
+                            "signals":        _rt.signals,
+                            "routing_reason": _routing_reason,
+                        },
+                    )
+                    return QueryResponse(
+                        answer=rt_cloud.answer,
+                        source=rt_cloud.provider,
+                        model_used=rt_cloud.model,
+                        skill=skill,
+                        latency_ms=total_ms,
+                        confidence_score=None,
+                        tokens=tokens,
+                        session_id=req.session_id,
+                        realtime_intent=True,
+                        realtime_signals=_rt.signals,
+                        routing_reason=_routing_reason,
+                    )
+                except cloud_llms.ProviderError as rt_exc:
+                    if _router._is_billing_error(rt_exc):
+                        _router._mark_degraded(selected)
+                    _log.warning(
+                        "realtime_provider_failed provider=%s falling_through",
+                        selected,
+                        extra={"provider": selected, "error": str(rt_exc)},
+                    )
+                    # Fall through to normal local->cloud routing
+
         if not req.force_cloud:
             # Step 1: run query through local LLM
             local = await local_llm.query(req.query, req.system, req.messages, skill=skill)
@@ -814,6 +883,33 @@ async def query_stream_endpoint(req: QueryRequest):
             "skill":         skill,
         },
     )
+
+    # Realtime intent — route to cloud and fake-stream the response for UX continuity
+    _rt_s = classify_intent(req.query)
+    if _rt_s.is_realtime:
+        preferred = _rt_s.preferred_provider
+        available = [p for p in ["grok", "openai", "claude"] if not _router._is_degraded(p)]
+        selected  = preferred if preferred in available else (available[0] if available else None)
+        if selected:
+            _signals = _rt_s.signals
+            async def realtime_cloud_stream():
+                try:
+                    cloud = await cloud_llms.query(selected, req.query, req.system, messages=req.messages)
+                    answer = cloud.answer
+                    for i in range(0, max(len(answer), 1), 4):
+                        yield f"data: {json.dumps({'token': answer[i:i+4], 'done': False})}\n\n"
+                    yield f"data: {json.dumps({'token': '', 'done': True, 'metadata': {'routed_to': cloud.provider, 'source': cloud.provider, 'model_used': cloud.model, 'skill': skill, 'confidence_score': None, 'latency_ms': cloud.latency_ms, 'tokens': {'input': cloud.input_tokens, 'output': cloud.output_tokens, 'total': cloud.input_tokens + cloud.output_tokens}, 'realtime_intent': True, 'realtime_signals': _signals}})}\n\n"
+                except Exception as exc:
+                    if isinstance(exc, cloud_llms.ProviderError) and _router._is_billing_error(exc):
+                        _router._mark_degraded(selected)
+                    _log.warning("stream_realtime_failed provider=%s", selected, extra={"provider": selected, "error": str(exc)})
+                    async for chunk in local_llm.generate_stream(req.query, req.system, req.messages, skill=skill):
+                        yield chunk
+            return StreamingResponse(
+                realtime_cloud_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
 
     async def event_stream():
         try:
