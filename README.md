@@ -7,10 +7,22 @@ POST /query  (or /query/stream)
   │
   ├─ realtime_classifier ──is_realtime──► cloud LLM (Grok/OpenAI) ──► return
   │
+  ├─ local-only skill (conversational/definition/creative/how_to/opinion_advice/language_task)
+  │     └─ always local ──► return response
+  │
   ├─ local Ollama ──confidence OK──► return response
   │
-  └─ confidence low ───────────────► cloud LLM ──► return response
+  └─ confidence low ───────────────► cloud LLM (skill-matched) ──► return response
 ```
+
+`/query/stream` runs the exact same decision tree as `/query` — including a full,
+non-streaming local inference pass to get a real confidence score — before deciding
+where the answer comes from. Local-only skills stream live from Ollama token-by-token
+(no confidence check needed, since they never escalate). Everything else is decided
+first, then streamed: a true Ollama stream if the local answer is accepted, or a
+fake-streamed cloud response (chunked into the same SSE shape) if it escalates. This
+trades true incremental streaming for local answers in the escalatable skills for a
+routing decision that matches `/query` exactly.
 
 ## Project layout
 
@@ -216,29 +228,39 @@ Response:
 
 ### `POST /query/stream`
 
-Same request body as `/query`. Returns a Server-Sent Events (SSE) stream.
+Same request body as `/query`, same routing decision — see the diagram above. Returns
+a Server-Sent Events (SSE) stream.
 
-Each event is `data: <json>`. Token chunks: `{"chunk": "Hello"}`
+Token events: `data: {"token": "Hello", "done": false}`
 
-Done event (final):
+Done event (final) — routing/confidence info is nested under `metadata`:
 
 ```json
 {
+  "token": "",
   "done": true,
-  "routed_to": "local",
-  "source": "local",
-  "model_used": "gemma2:2b",
-  "skill": "general",
-  "latency_ms": 1234,
-  "confidence_score": null,
-  "realtime_intent": false,
-  "tokens": { "input": 42, "output": 87, "total": 129 },
-  "prompt_tokens": 42,
-  "completion_tokens": 87
+  "metadata": {
+    "routed_to": "local",
+    "source": "local",
+    "model_used": "gemma2:2b",
+    "skill": "general",
+    "confidence_score": 0.7967,
+    "latency_ms": 1234,
+    "tokens": { "input": 42, "output": 87, "total": 129 },
+    "prompt_tokens": 42,
+    "completion_tokens": 87
+  }
 }
 ```
 
-For cloud-routed responses, `routed_to` is the provider name (e.g. `"claude"`, `"grok"`).
+For cloud-routed responses, `metadata.routed_to`/`metadata.source` are the provider
+name (e.g. `"claude"`, `"grok"`, `"openai"`), `metadata.escalated: true` is set when the
+route was a confidence-based escalation (as opposed to `metadata.realtime_intent: true`
+for the realtime bypass, or `metadata.retry: true` for a local-first retry that avoided
+escalation). `confidence_score` is `null` only for realtime-bypass and force-cloud
+responses, where no local inference ran.
+
+On error, a single event is emitted instead: `data: {"error": true, "message": "...", "provider": "ollama", "done": true}`.
 
 ### `GET /health`
 

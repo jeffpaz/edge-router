@@ -4,6 +4,14 @@ All notable changes to edge-router are documented here.
 
 ---
 
+## 2026-07-18
+
+### Fixed
+- **`/query/stream` never escalated to cloud on low confidence** — the streaming endpoint only checked `realtime_classifier` (sports/news/price intent) and otherwise streamed unconditionally from Ollama, ignoring the skill classifier's `SKILL_THRESHOLDS` entirely. Queries classified into always-escalate skills (`math_data`, `current_events`, `sports_people`, threshold `1.0`) — e.g. "How many In-N-Out locations are there?", "What's the average humidity in Las Vegas in July?" — stayed local instead of escalating, and the SSE done-event's `confidence_score` was hardcoded `null` (rendered as 0% by the frontend).
+- **`main.py`: `query_stream_endpoint` rewritten** to mirror `/query`'s routing logic exactly: local-only skills (`conversational`, `definition`, `creative`, `how_to`, `opinion_advice`, `language_task`) still stream live from Ollama since they never escalate; everything else runs `local_llm.query()` to completion first for a real confidence score, applies the local-first retry (general/coding), and escalates to the skill-matched cloud provider when `should_escalate` is true — then fake-streams whichever answer was chosen. Trades true incremental token streaming for escalatable skills in exchange for a routing decision that matches `/query`.
+
+---
+
 ## 2026-06-12
 
 ### Added

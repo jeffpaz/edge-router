@@ -868,11 +868,18 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
 # POST /query/stream
 # ---------------------------------------------------------------------------
 
+async def _fake_stream_text(answer: str, chunk_size: int = 4):
+    """Chunk a pre-generated answer into SSE token events for UX continuity."""
+    for i in range(0, max(len(answer), 1), chunk_size):
+        yield f"data: {json.dumps({'token': answer[i:i+chunk_size], 'done': False})}\n\n"
+
+
 @app.post("/query/stream")
 async def query_stream_endpoint(req: QueryRequest):
-    """Stream local Ollama tokens as Server-Sent Events."""
+    """Stream tokens as Server-Sent Events, escalating to cloud on low local confidence."""
     req_id = uuid.uuid4().hex[:8]
     skill = _router.skill_router.classify(req.query)
+    t_wall = time.monotonic()
 
     _log.info(
         "stream_query_received",
@@ -895,9 +902,8 @@ async def query_stream_endpoint(req: QueryRequest):
             async def realtime_cloud_stream():
                 try:
                     cloud = await cloud_llms.query(selected, req.query, req.system, messages=req.messages)
-                    answer = cloud.answer
-                    for i in range(0, max(len(answer), 1), 4):
-                        yield f"data: {json.dumps({'token': answer[i:i+4], 'done': False})}\n\n"
+                    async for chunk in _fake_stream_text(cloud.answer):
+                        yield chunk
                     yield f"data: {json.dumps({'token': '', 'done': True, 'metadata': {'routed_to': cloud.provider, 'source': cloud.provider, 'model_used': cloud.model, 'skill': skill, 'confidence_score': None, 'latency_ms': cloud.latency_ms, 'tokens': {'input': cloud.input_tokens, 'output': cloud.output_tokens, 'total': cloud.input_tokens + cloud.output_tokens}, 'realtime_intent': True, 'realtime_signals': _signals}})}\n\n"
                 except Exception as exc:
                     if isinstance(exc, cloud_llms.ProviderError) and _router._is_billing_error(exc):
@@ -911,18 +917,121 @@ async def query_stream_endpoint(req: QueryRequest):
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
 
-    async def event_stream():
+    # Local-only skills never escalate regardless of confidence — stream Ollama live.
+    if skill in _router.LOCAL_ONLY_SKILLS:
+        async def local_only_stream():
+            try:
+                async for chunk in local_llm.generate_stream(
+                    req.query, req.system, req.messages, skill=skill
+                ):
+                    yield chunk
+            except Exception as exc:
+                _log.error("stream_error req_id=%s error=%s", req_id, exc)
+                yield f"data: {json.dumps({'error': True, 'message': str(exc)[:200], 'provider': 'ollama', 'done': True})}\n\n"
+        return StreamingResponse(
+            local_only_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # ── Accurate escalation path ──────────────────────────────────────────────
+    # Run the local model to completion first so the real confidence score (not a
+    # guess) decides whether to escalate — mirrors the non-streaming /query flow.
+    # This trades true incremental local streaming for a correct routing decision.
+    async def routed_stream():
         try:
-            async for chunk in local_llm.generate_stream(
-                req.query, req.system, req.messages, skill=skill
-            ):
-                yield chunk
+            local = await local_llm.query(req.query, req.system, req.messages, skill=skill)
         except Exception as exc:
-            _log.error("stream_error req_id=%s error=%s", req_id, exc)
+            _log.error("stream_local_query_failed req_id=%s error=%s", req_id, exc)
             yield f"data: {json.dumps({'error': True, 'message': str(exc)[:200], 'provider': 'ollama', 'done': True})}\n\n"
+            return
+
+        _log.info(
+            "stream_local_inference",
+            extra={
+                "req_id":         req_id,
+                "confidence":     local["confidence"],
+                "should_escalate": local["should_escalate"],
+                "signals":        local["signals"],
+            },
+        )
+
+        if not local["should_escalate"]:
+            async for chunk in _fake_stream_text(local["answer"]):
+                yield chunk
+            metadata = {
+                "routed_to":         "local",
+                "source":            "local",
+                "model":             local["model"],
+                "model_used":        local["model"],
+                "skill":             skill,
+                "confidence_score":  local["confidence"],
+                "latency_ms":        round((time.monotonic() - t_wall) * 1000),
+                "tokens": {
+                    "input":  local["prompt_tokens"],
+                    "output": local["completion_tokens"],
+                    "total":  local["prompt_tokens"] + local["completion_tokens"],
+                },
+                "prompt_tokens":     local["prompt_tokens"],
+                "completion_tokens": local["completion_tokens"],
+            }
+            yield f"data: {json.dumps({'token': '', 'done': True, 'metadata': metadata})}\n\n"
+            return
+
+        # Local-first retry with a simplified query (general/coding only) — mirrors /query
+        if config.RETRY_ENABLED and skill in ("general", "coding"):
+            simplified = _router._simplify_query(req.query)
+            if simplified != req.query:
+                retry_local = await local_llm.query(simplified, req.system, req.messages, skill=skill)
+                if not retry_local["should_escalate"]:
+                    async for chunk in _fake_stream_text(retry_local["answer"]):
+                        yield chunk
+                    metadata = {
+                        "routed_to":         "local",
+                        "source":            "local",
+                        "model":             retry_local["model"],
+                        "model_used":        retry_local["model"],
+                        "skill":             skill,
+                        "confidence_score":  retry_local["confidence"],
+                        "latency_ms":        round((time.monotonic() - t_wall) * 1000),
+                        "tokens": {
+                            "input":  retry_local["prompt_tokens"],
+                            "output": retry_local["completion_tokens"],
+                            "total":  retry_local["prompt_tokens"] + retry_local["completion_tokens"],
+                        },
+                        "prompt_tokens":     retry_local["prompt_tokens"],
+                        "completion_tokens": retry_local["completion_tokens"],
+                        "retry":             True,
+                    }
+                    yield f"data: {json.dumps({'token': '', 'done': True, 'metadata': metadata})}\n\n"
+                    return
+
+        # Escalate to the skill-matched cloud LLM
+        cloud = await _router.skill_router.dispatch(
+            req.query, skill, req.system, req.messages,
+            local_answer=local["answer"],
+            confidence=local["confidence"],
+        )
+        async for chunk in _fake_stream_text(cloud.answer):
+            yield chunk
+        metadata = {
+            "routed_to":        cloud.provider,
+            "source":           cloud.provider,
+            "model_used":       cloud.model,
+            "skill":            skill,
+            "confidence_score": local["confidence"],
+            "latency_ms":       round((time.monotonic() - t_wall) * 1000),
+            "tokens": {
+                "input":  cloud.input_tokens,
+                "output": cloud.output_tokens,
+                "total":  cloud.input_tokens + cloud.output_tokens,
+            },
+            "escalated": True,
+        }
+        yield f"data: {json.dumps({'token': '', 'done': True, 'metadata': metadata})}\n\n"
 
     return StreamingResponse(
-        event_stream(),
+        routed_stream(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
