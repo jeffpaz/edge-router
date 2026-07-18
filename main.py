@@ -10,6 +10,7 @@ import time
 import uuid
 from collections import deque, OrderedDict
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -453,6 +454,112 @@ class QueryResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Shared local-first / escalate decision — used by both /query and /query/stream
+# so the routing policy (local-only skills, confidence threshold, local-first
+# retry, cloud dispatch) lives in exactly one place.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _ResolvedQuery:
+    source: str             # "local" | cloud provider name | "error"
+    answer: str
+    model: str
+    confidence: float
+    input_tokens: int
+    output_tokens: int
+    local_only: bool = False
+    retry: bool = False
+    escalated: bool = False
+    cloud_latency_ms: float | None = None
+
+
+async def _resolve_query(query: str, system: str, messages: list, skill: str, req_id: str = "") -> _ResolvedQuery:
+    """Run the local model, then decide whether to return it or escalate to cloud.
+
+    Local-only skills and confident local answers return immediately. general/coding
+    get one local-first retry with a simplified query before escalating. Everything
+    else escalates to the skill-matched cloud LLM via SkillRouter.dispatch(), which
+    never raises.
+    """
+    local = await local_llm.query(query, system, messages, skill=skill)
+    _log.info(
+        "local_inference",
+        extra={
+            "req_id":         req_id,
+            "skill":          skill,
+            "model":          local["model"],
+            "confidence":     local["confidence"],
+            "should_escalate": local["should_escalate"],
+            "signals":        local["signals"],
+        },
+    )
+
+    if skill in _router.LOCAL_ONLY_SKILLS:
+        _log.info(
+            "local-only skill — no escalation",
+            extra={"req_id": req_id, "skill": skill, "confidence": local["confidence"], "routed_to": "ollama"},
+        )
+        return _ResolvedQuery(
+            source="local", answer=local["answer"], model=local["model"],
+            confidence=local["confidence"],
+            input_tokens=local["prompt_tokens"], output_tokens=local["completion_tokens"],
+            local_only=True,
+        )
+
+    if not local["should_escalate"]:
+        return _ResolvedQuery(
+            source="local", answer=local["answer"], model=local["model"],
+            confidence=local["confidence"],
+            input_tokens=local["prompt_tokens"], output_tokens=local["completion_tokens"],
+        )
+
+    if config.RETRY_ENABLED and skill in ("general", "coding"):
+        simplified = _router._simplify_query(query)
+        if simplified != query:
+            _log.info(
+                "local_retry_attempt",
+                extra={"req_id": req_id, "skill": skill, "simplified_preview": simplified[:60]},
+            )
+            retry_local = await local_llm.query(simplified, system, messages, skill=skill)
+            if not retry_local["should_escalate"]:
+                _log.info(
+                    "local retry succeeded — escalation avoided",
+                    extra={"req_id": req_id, "skill": skill, "confidence": retry_local["confidence"]},
+                )
+                return _ResolvedQuery(
+                    source="local", answer=retry_local["answer"], model=retry_local["model"],
+                    confidence=retry_local["confidence"],
+                    input_tokens=retry_local["prompt_tokens"], output_tokens=retry_local["completion_tokens"],
+                    retry=True,
+                )
+            _log.info(
+                "local_retry_failed — escalating to cloud",
+                extra={"req_id": req_id, "skill": skill, "retry_confidence": retry_local["confidence"]},
+            )
+
+    _log.info(
+        "escalating_to_cloud",
+        extra={
+            "req_id":     req_id,
+            "skill":      skill,
+            "confidence": local["confidence"],
+            "threshold":  config.SKILL_THRESHOLDS.get(skill, config.CONFIDENCE_THRESHOLD),
+        },
+    )
+    cloud = await _router.skill_router.dispatch(
+        query, skill, system, messages,
+        local_answer=local["answer"],
+        confidence=local["confidence"],
+    )
+    return _ResolvedQuery(
+        source=cloud.provider, answer=cloud.answer, model=cloud.model,
+        confidence=local["confidence"],
+        input_tokens=cloud.input_tokens, output_tokens=cloud.output_tokens,
+        escalated=True, cloud_latency_ms=cloud.latency_ms,
+    )
+
+
+# ---------------------------------------------------------------------------
 # POST /query
 # ---------------------------------------------------------------------------
 
@@ -500,8 +607,6 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
             )
 
     skill = _router.skill_router.classify(req.query)
-    local_confidence: float | None = None
-    local_answer: str | None = None
 
     try:
         # ── Realtime intent bypass — skips local LLM for sports/news/price ──────
@@ -569,218 +674,80 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
                     )
                     # Fall through to normal local->cloud routing
 
-        if not req.force_cloud:
-            # Step 1: run query through local LLM
-            local = await local_llm.query(req.query, req.system, req.messages, skill=skill)
-            local_confidence = local["confidence"]
-            local_answer = local["answer"]
-
+        if req.force_cloud:
+            cloud = await _router.skill_router.dispatch(req.query, skill, req.system, req.messages)
+            total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
+            tokens   = TokenBreakdown(
+                input=cloud.input_tokens,
+                output=cloud.output_tokens,
+                total=cloud.input_tokens + cloud.output_tokens,
+            )
+            status = "fallback" if cloud.provider == "error" else "success"
+            _stats.record({
+                "ts":               datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "session_id":       req.session_id,
+                "source":           cloud.provider,
+                "model_used":       cloud.model,
+                "skill":            skill,
+                "latency_ms":       total_ms,
+                "confidence_score": None,
+                "tokens":           tokens.model_dump(),
+                "status":           status,
+            })
             _log.info(
-                "local_inference",
+                "routed",
                 extra={
-                    "req_id": req_id,
-                    "model": local["model"],
-                    "confidence": local["confidence"],
-                    "should_escalate": local["should_escalate"],
-                    "signals": local["signals"],
+                    "req_id":           req_id,
+                    "session_id":       req.session_id,
+                    "source":           cloud.provider,
+                    "model":            cloud.model,
+                    "skill":            skill,
+                    "cloud_latency_ms": cloud.latency_ms,
+                    "total_latency_ms": total_ms,
+                    "tokens":           tokens.model_dump(),
+                    "forced_cloud":     True,
+                    "status":           status,
                 },
             )
-
-            # Local-only skills — always return local answer, never escalate
-            if skill in _router.LOCAL_ONLY_SKILLS:
-                total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
-                tokens   = TokenBreakdown(
-                    input=local["prompt_tokens"],
-                    output=local["completion_tokens"],
-                    total=local["prompt_tokens"] + local["completion_tokens"],
-                )
-                _log.info(
-                    "local-only skill — no escalation",
-                    extra={
-                        "req_id":     req_id,
-                        "session_id": req.session_id,
-                        "skill":      skill,
-                        "confidence": local["confidence"],
-                        "routed_to":  "ollama",
-                    },
-                )
-                _cache_put(req.query, {
-                    "answer":           local["answer"],
-                    "source":           "local",
-                    "model_used":       local["model"],
-                    "skill":            skill,
-                    "confidence_score": local["confidence"],
-                    "tokens":           tokens.model_dump(),
-                }, skill, local["confidence"])
-                _stats.record({
-                    "ts":               datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                    "session_id":       req.session_id,
-                    "source":           "local",
-                    "model_used":       local["model"],
-                    "skill":            skill,
-                    "latency_ms":       total_ms,
-                    "confidence_score": local_confidence,
-                    "tokens":           tokens.model_dump(),
-                    "status":           "success",
-                })
-                return QueryResponse(
-                    answer=local["answer"],
-                    source="local",
-                    model_used=local["model"],
-                    skill=skill,
-                    latency_ms=total_ms,
-                    confidence_score=local_confidence,
-                    tokens=tokens,
-                    session_id=req.session_id,
-                )
-
-            # Step 2: confidence is sufficient — return local answer
-            if not local["should_escalate"]:
-                total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
-                tokens   = TokenBreakdown(
-                    input=local["prompt_tokens"],
-                    output=local["completion_tokens"],
-                    total=local["prompt_tokens"] + local["completion_tokens"],
-                )
-                _cache_put(req.query, {
-                    "answer":           local["answer"],
-                    "source":           "local",
-                    "model_used":       local["model"],
-                    "skill":            skill,
-                    "confidence_score": local["confidence"],
-                    "tokens":           tokens.model_dump(),
-                }, skill, local["confidence"])
-                _stats.record({
-                    "ts":               datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                    "session_id":       req.session_id,
-                    "source":           "local",
-                    "model_used":       local["model"],
-                    "skill":            skill,
-                    "latency_ms":       total_ms,
-                    "confidence_score": local_confidence,
-                    "tokens":           tokens.model_dump(),
-                    "status":           "success",
-                })
-                _log.info(
-                    "routed",
-                    extra={
-                        "req_id":     req_id,
-                        "session_id": req.session_id,
-                        "source":     "local",
-                        "model":      local["model"],
-                        "skill":      skill,
-                        "latency_ms": total_ms,
-                        "tokens":     tokens.model_dump(),
-                        "status":     "success",
-                    },
-                )
-                return QueryResponse(
-                    answer=local["answer"],
-                    source="local",
-                    model_used=local["model"],
-                    skill=skill,
-                    latency_ms=total_ms,
-                    confidence_score=local_confidence,
-                    tokens=tokens,
-                    session_id=req.session_id,
-                )
-
-            # Step 2b: local-first retry with simplified query (general and coding only)
-            if config.RETRY_ENABLED and skill in ("general", "coding"):
-                simplified = _router._simplify_query(req.query)
-                if simplified != req.query:
-                    _log.info(
-                        "local_retry_attempt req_id=%s skill=%s simplified_preview=%.60s",
-                        req_id,
-                        skill,
-                        simplified[:60],
-                        extra={"req_id": req_id, "skill": skill, "simplified_preview": simplified[:60]},
-                    )
-                    retry_local = await local_llm.query(simplified, req.system, req.messages, skill=skill)
-                    if not retry_local["should_escalate"]:
-                        total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
-                        tokens   = TokenBreakdown(
-                            input=retry_local["prompt_tokens"],
-                            output=retry_local["completion_tokens"],
-                            total=retry_local["prompt_tokens"] + retry_local["completion_tokens"],
-                        )
-                        _log.info(
-                            "local retry succeeded — escalation avoided skill=%s confidence=%.4f",
-                            skill,
-                            retry_local["confidence"],
-                            extra={
-                                "req_id":     req_id,
-                                "skill":      skill,
-                                "confidence": retry_local["confidence"],
-                            },
-                        )
-                        _cache_put(req.query, {
-                            "answer":           retry_local["answer"],
-                            "source":           "local",
-                            "model_used":       retry_local["model"],
-                            "skill":            skill,
-                            "confidence_score": retry_local["confidence"],
-                            "tokens":           tokens.model_dump(),
-                        }, skill, retry_local["confidence"])
-                        _stats.record({
-                            "ts":               datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                            "session_id":       req.session_id,
-                            "source":           "local",
-                            "model_used":       retry_local["model"],
-                            "skill":            skill,
-                            "latency_ms":       total_ms,
-                            "confidence_score": retry_local["confidence"],
-                            "tokens":           tokens.model_dump(),
-                            "status":           "retry_success",
-                        })
-                        return QueryResponse(
-                            answer=retry_local["answer"],
-                            source="local",
-                            model_used=retry_local["model"],
-                            skill=skill,
-                            latency_ms=total_ms,
-                            confidence_score=retry_local["confidence"],
-                            tokens=tokens,
-                            session_id=req.session_id,
-                        )
-                    _log.info(
-                        "local_retry_failed skill=%s retry_confidence=%.4f — escalating to cloud",
-                        skill,
-                        retry_local["confidence"],
-                        extra={"req_id": req_id, "skill": skill, "retry_confidence": retry_local["confidence"]},
-                    )
-
-            _log.info(
-                "escalating_to_cloud",
-                extra={
-                    "req_id":     req_id,
-                    "skill":      skill,
-                    "confidence": local["confidence"],
-                    "threshold":  config.SKILL_THRESHOLDS.get(skill, config.CONFIDENCE_THRESHOLD),
-                },
+            return QueryResponse(
+                answer=cloud.answer,
+                source=cloud.provider,
+                model_used=cloud.model,
+                skill=skill,
+                latency_ms=total_ms,
+                confidence_score=None,
+                tokens=tokens,
+                session_id=req.session_id,
             )
 
-        # Step 3: dispatch to the skill-matched cloud LLM (with fallback chain)
-        cloud    = await _router.skill_router.dispatch(
-            req.query, skill, req.system, req.messages,
-            local_answer=local_answer,
-            confidence=local_confidence,
-        )
+        # ── Local-first / escalate — shared with /query/stream ───────────────
+        result = await _resolve_query(req.query, req.system, req.messages, skill, req_id=req_id)
         total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
         tokens   = TokenBreakdown(
-            input=cloud.input_tokens,
-            output=cloud.output_tokens,
-            total=cloud.input_tokens + cloud.output_tokens,
+            input=result.input_tokens,
+            output=result.output_tokens,
+            total=result.input_tokens + result.output_tokens,
         )
-        status = "fallback" if cloud.provider == "error" else "success"
+        if result.source == "local":
+            _cache_put(req.query, {
+                "answer":           result.answer,
+                "source":           "local",
+                "model_used":       result.model,
+                "skill":            skill,
+                "confidence_score": result.confidence,
+                "tokens":           tokens.model_dump(),
+            }, skill, result.confidence)
+            status = "retry_success" if result.retry else "success"
+        else:
+            status = "fallback" if result.source == "error" else "success"
         _stats.record({
             "ts":               datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             "session_id":       req.session_id,
-            "source":           cloud.provider,
-            "model_used":       cloud.model,
+            "source":           result.source,
+            "model_used":       result.model,
             "skill":            skill,
             "latency_ms":       total_ms,
-            "confidence_score": local_confidence,
+            "confidence_score": result.confidence,
             "tokens":           tokens.model_dump(),
             "status":           status,
         })
@@ -789,23 +756,23 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
             extra={
                 "req_id":           req_id,
                 "session_id":       req.session_id,
-                "source":           cloud.provider,
-                "model":            cloud.model,
+                "source":           result.source,
+                "model":            result.model,
                 "skill":            skill,
-                "cloud_latency_ms": cloud.latency_ms,
+                "cloud_latency_ms": result.cloud_latency_ms,
                 "total_latency_ms": total_ms,
                 "tokens":           tokens.model_dump(),
-                "forced_cloud":     req.force_cloud,
+                "forced_cloud":     False,
                 "status":           status,
             },
         )
         return QueryResponse(
-            answer=cloud.answer,
-            source=cloud.provider,
-            model_used=cloud.model,
+            answer=result.answer,
+            source=result.source,
+            model_used=result.model,
             skill=skill,
             latency_ms=total_ms,
-            confidence_score=local_confidence,
+            confidence_score=result.confidence,
             tokens=tokens,
             session_id=req.session_id,
         )
@@ -874,11 +841,46 @@ async def _fake_stream_text(answer: str, chunk_size: int = 4):
         yield f"data: {json.dumps({'token': answer[i:i+chunk_size], 'done': False})}\n\n"
 
 
+async def _heartbeat_until_done(task: asyncio.Task, interval: float = 15.0):
+    """Yield empty-token SSE events every `interval`s while `task` is still
+    running, so a proxy/client idle-read timeout doesn't kill the connection
+    during the blocking local-inference pass. Shaped identically to a real
+    token event (empty string), so no client-side special-casing is needed.
+    """
+    while not task.done():
+        await asyncio.wait({task}, timeout=interval)
+        if not task.done():
+            yield f"data: {json.dumps({'token': '', 'done': False})}\n\n"
+
+
+def _stream_metadata(result: "_ResolvedQuery", skill: str, t_wall: float) -> dict:
+    metadata = {
+        "routed_to":         result.source,
+        "source":            result.source,
+        "model":             result.model,
+        "model_used":        result.model,
+        "skill":             skill,
+        "confidence_score":  result.confidence,
+        "latency_ms":        round((time.monotonic() - t_wall) * 1000),
+        "tokens": {
+            "input":  result.input_tokens,
+            "output": result.output_tokens,
+            "total":  result.input_tokens + result.output_tokens,
+        },
+        "prompt_tokens":     result.input_tokens,
+        "completion_tokens": result.output_tokens,
+    }
+    if result.retry:
+        metadata["retry"] = True
+    if result.escalated:
+        metadata["escalated"] = True
+    return metadata
+
+
 @app.post("/query/stream")
 async def query_stream_endpoint(req: QueryRequest):
     """Stream tokens as Server-Sent Events, escalating to cloud on low local confidence."""
     req_id = uuid.uuid4().hex[:8]
-    skill = _router.skill_router.classify(req.query)
     t_wall = time.monotonic()
 
     _log.info(
@@ -887,9 +889,36 @@ async def query_stream_endpoint(req: QueryRequest):
             "req_id":        req_id,
             "session_id":    req.session_id,
             "query_preview": req.query[:120],
-            "skill":         skill,
         },
     )
+
+    # ── Cache check — return immediately on hit, skip all inference ──────────
+    cached = _cache_get(req.query)
+    if cached is not None:
+        async def cached_stream():
+            async for chunk in _fake_stream_text(cached["answer"]):
+                yield chunk
+            metadata = {
+                "routed_to":         cached["source"],
+                "source":            cached["source"],
+                "model":             cached["model_used"],
+                "model_used":        cached["model_used"],
+                "skill":             cached["skill"],
+                "confidence_score":  cached["confidence_score"],
+                "latency_ms":        round((time.monotonic() - t_wall) * 1000),
+                "tokens":            cached["tokens"],
+                "prompt_tokens":     cached["tokens"]["input"],
+                "completion_tokens": cached["tokens"]["output"],
+                "cache_hit":         True,
+            }
+            yield f"data: {json.dumps({'token': '', 'done': True, 'metadata': metadata})}\n\n"
+        return StreamingResponse(
+            cached_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    skill = _router.skill_router.classify(req.query)
 
     # Realtime intent — route to cloud and fake-stream the response for UX continuity
     _rt_s = classify_intent(req.query)
@@ -934,101 +963,39 @@ async def query_stream_endpoint(req: QueryRequest):
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    # ── Accurate escalation path ──────────────────────────────────────────────
+    # ── Accurate escalation path — shared decision logic with /query ─────────
     # Run the local model to completion first so the real confidence score (not a
-    # guess) decides whether to escalate — mirrors the non-streaming /query flow.
-    # This trades true incremental local streaming for a correct routing decision.
+    # guess) decides whether to escalate. This trades true incremental local
+    # streaming for a routing decision that matches /query exactly. A heartbeat
+    # keeps the connection alive while _resolve_query() runs.
     async def routed_stream():
+        task = asyncio.ensure_future(_resolve_query(req.query, req.system, req.messages, skill, req_id=req_id))
         try:
-            local = await local_llm.query(req.query, req.system, req.messages, skill=skill)
+            async for heartbeat in _heartbeat_until_done(task):
+                yield heartbeat
+            result = task.result()
         except Exception as exc:
-            _log.error("stream_local_query_failed req_id=%s error=%s", req_id, exc)
+            _log.error("stream_resolve_failed req_id=%s error=%s", req_id, exc)
             yield f"data: {json.dumps({'error': True, 'message': str(exc)[:200], 'provider': 'ollama', 'done': True})}\n\n"
             return
 
-        _log.info(
-            "stream_local_inference",
-            extra={
-                "req_id":         req_id,
-                "confidence":     local["confidence"],
-                "should_escalate": local["should_escalate"],
-                "signals":        local["signals"],
-            },
-        )
-
-        if not local["should_escalate"]:
-            async for chunk in _fake_stream_text(local["answer"]):
-                yield chunk
-            metadata = {
-                "routed_to":         "local",
-                "source":            "local",
-                "model":             local["model"],
-                "model_used":        local["model"],
-                "skill":             skill,
-                "confidence_score":  local["confidence"],
-                "latency_ms":        round((time.monotonic() - t_wall) * 1000),
-                "tokens": {
-                    "input":  local["prompt_tokens"],
-                    "output": local["completion_tokens"],
-                    "total":  local["prompt_tokens"] + local["completion_tokens"],
-                },
-                "prompt_tokens":     local["prompt_tokens"],
-                "completion_tokens": local["completion_tokens"],
-            }
-            yield f"data: {json.dumps({'token': '', 'done': True, 'metadata': metadata})}\n\n"
-            return
-
-        # Local-first retry with a simplified query (general/coding only) — mirrors /query
-        if config.RETRY_ENABLED and skill in ("general", "coding"):
-            simplified = _router._simplify_query(req.query)
-            if simplified != req.query:
-                retry_local = await local_llm.query(simplified, req.system, req.messages, skill=skill)
-                if not retry_local["should_escalate"]:
-                    async for chunk in _fake_stream_text(retry_local["answer"]):
-                        yield chunk
-                    metadata = {
-                        "routed_to":         "local",
-                        "source":            "local",
-                        "model":             retry_local["model"],
-                        "model_used":        retry_local["model"],
-                        "skill":             skill,
-                        "confidence_score":  retry_local["confidence"],
-                        "latency_ms":        round((time.monotonic() - t_wall) * 1000),
-                        "tokens": {
-                            "input":  retry_local["prompt_tokens"],
-                            "output": retry_local["completion_tokens"],
-                            "total":  retry_local["prompt_tokens"] + retry_local["completion_tokens"],
-                        },
-                        "prompt_tokens":     retry_local["prompt_tokens"],
-                        "completion_tokens": retry_local["completion_tokens"],
-                        "retry":             True,
-                    }
-                    yield f"data: {json.dumps({'token': '', 'done': True, 'metadata': metadata})}\n\n"
-                    return
-
-        # Escalate to the skill-matched cloud LLM
-        cloud = await _router.skill_router.dispatch(
-            req.query, skill, req.system, req.messages,
-            local_answer=local["answer"],
-            confidence=local["confidence"],
-        )
-        async for chunk in _fake_stream_text(cloud.answer):
+        async for chunk in _fake_stream_text(result.answer):
             yield chunk
-        metadata = {
-            "routed_to":        cloud.provider,
-            "source":           cloud.provider,
-            "model_used":       cloud.model,
-            "skill":            skill,
-            "confidence_score": local["confidence"],
-            "latency_ms":       round((time.monotonic() - t_wall) * 1000),
-            "tokens": {
-                "input":  cloud.input_tokens,
-                "output": cloud.output_tokens,
-                "total":  cloud.input_tokens + cloud.output_tokens,
-            },
-            "escalated": True,
-        }
-        yield f"data: {json.dumps({'token': '', 'done': True, 'metadata': metadata})}\n\n"
+        yield f"data: {json.dumps({'token': '', 'done': True, 'metadata': _stream_metadata(result, skill, t_wall)})}\n\n"
+
+        if result.source == "local":
+            _cache_put(req.query, {
+                "answer":           result.answer,
+                "source":           "local",
+                "model_used":       result.model,
+                "skill":            skill,
+                "confidence_score": result.confidence,
+                "tokens": {
+                    "input":  result.input_tokens,
+                    "output": result.output_tokens,
+                    "total":  result.input_tokens + result.output_tokens,
+                },
+            }, skill, result.confidence)
 
     return StreamingResponse(
         routed_stream(),

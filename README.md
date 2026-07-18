@@ -15,14 +15,18 @@ POST /query  (or /query/stream)
   └─ confidence low ───────────────► cloud LLM (skill-matched) ──► return response
 ```
 
-`/query/stream` runs the exact same decision tree as `/query` — including a full,
-non-streaming local inference pass to get a real confidence score — before deciding
-where the answer comes from. Local-only skills stream live from Ollama token-by-token
-(no confidence check needed, since they never escalate). Everything else is decided
-first, then streamed: a true Ollama stream if the local answer is accepted, or a
-fake-streamed cloud response (chunked into the same SSE shape) if it escalates. This
-trades true incremental streaming for local answers in the escalatable skills for a
-routing decision that matches `/query` exactly.
+`/query` and `/query/stream` share one routing implementation (`main.py`'s
+`_resolve_query()`), so the two endpoints can't drift out of sync on which
+queries escalate. Local-only skills are the one exception in `/query/stream`:
+they skip `_resolve_query()` entirely and stream live from Ollama token-by-token,
+since they never need a confidence check. Every other skill is resolved first
+(local answer, local-first retry, or cloud escalation — whichever `_resolve_query()`
+lands on), then the result is chunked into the same SSE shape either way. This
+means local answers in escalatable skills (general, coding, math_data, current_events,
+sports_people) arrive as a single completed block rather than token-by-token — the
+trade for a routing decision that's guaranteed to match `/query`. A heartbeat event
+is sent periodically while `_resolve_query()` is running so the connection doesn't
+idle out on a slow local pass. Both endpoints also share the same response cache.
 
 ## Project layout
 
@@ -231,9 +235,15 @@ Response:
 Same request body as `/query`, same routing decision — see the diagram above. Returns
 a Server-Sent Events (SSE) stream.
 
-Token events: `data: {"token": "Hello", "done": false}`
+Token events: `data: {"token": "Hello", "done": false}`. While `_resolve_query()`
+is running (the local-first/escalate decision), an empty-token event of the same
+shape (`data: {"token": "", "done": false}`) may be sent periodically as a
+heartbeat, so a proxy or client idle-read timeout doesn't kill the connection
+during a slow local pass — safe to concatenate like any other token event.
 
-Done event (final) — routing/confidence info is nested under `metadata`:
+Done event (final) — routing/confidence info is nested under `metadata`, and
+its shape is identical regardless of which path answered (local, retry, or
+cloud escalation):
 
 ```json
 {
@@ -254,11 +264,15 @@ Done event (final) — routing/confidence info is nested under `metadata`:
 ```
 
 For cloud-routed responses, `metadata.routed_to`/`metadata.source` are the provider
-name (e.g. `"claude"`, `"grok"`, `"openai"`), `metadata.escalated: true` is set when the
-route was a confidence-based escalation (as opposed to `metadata.realtime_intent: true`
-for the realtime bypass, or `metadata.retry: true` for a local-first retry that avoided
-escalation). `confidence_score` is `null` only for realtime-bypass and force-cloud
-responses, where no local inference ran.
+name (e.g. `"claude"`, `"grok"`, `"openai"`) and `metadata.model`/`model_used` are the
+cloud model that answered — these fields are always present, whether the answer came
+from local, a local-first retry, or a cloud escalation. `metadata.escalated: true` is
+set when the route was a confidence-based escalation (as opposed to
+`metadata.realtime_intent: true` for the realtime bypass, or `metadata.retry: true`
+for a local-first retry that avoided escalation, or `metadata.cache_hit: true` when
+the answer came from the shared response cache instead of running inference at all).
+`confidence_score` is `null` only for realtime-bypass and force-cloud responses, where
+no local inference ran.
 
 On error, a single event is emitted instead: `data: {"error": true, "message": "...", "provider": "ollama", "done": true}`.
 
