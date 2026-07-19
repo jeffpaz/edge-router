@@ -62,6 +62,26 @@ def _mark_degraded(provider: str) -> None:
 # SkillRouter
 # ---------------------------------------------------------------------------
 
+# Generic sport names (hockey, golf, tennis, ...) are ambiguous on their own —
+# they show up just as often in creative/definition/how-to queries ("write a
+# poem about golf") as in real sports questions. Require one of these
+# sports-context signals to appear elsewhere in the query before the bare
+# sport name counts toward the sports_people skill.
+_SPORTS_CONTEXT = (
+    r"(?:team|score|scored|won|game|match|tournament|player|coach|franchise|"
+    r"league|roster|standings|championship|playoffs|season|drafted|traded|"
+    r"signed|nhl|nba|nfl|mlb|nascar|pga|fifa|ufc)"
+)
+
+
+def _sport_pattern(word: str) -> str:
+    """Match `word` only when a sports-context signal also appears in the query."""
+    return (
+        rf"\b{word}\b(?=.*\b{_SPORTS_CONTEXT}\b)"
+        rf"|\b{_SPORTS_CONTEXT}\b(?=.*\b{word}\b)"
+    )
+
+
 class SkillRouter:
     """Classifies a query into a skill and dispatches to the right cloud LLM.
 
@@ -103,8 +123,10 @@ class SkillRouter:
         ("sports_people", [
             r"\bnhl\b",        r"\bnba\b",         r"\bnfl\b",        r"\bmlb\b",
             r"\bnascar\b",     r"\bpga\b",         r"\bfifa\b",       r"\bufc\b",
-            r"\bhockey\b",     r"\bbasketball\b",  r"\bfootball\b",   r"\bbaseball\b",
-            r"\bsoccer\b",     r"\bgolf\b",        r"\btennis\b",
+            _sport_pattern("hockey"),     _sport_pattern("basketball"),
+            _sport_pattern("football"),   _sport_pattern("baseball"),
+            _sport_pattern("soccer"),     _sport_pattern("golf"),
+            _sport_pattern("tennis"),
             r"\bteam\b",       r"\bplayer\b",      r"\bcoach\b",      r"\bfranchise\b",
             r"\bleague\b",     r"\broster\b",      r"\bstandings\b",  r"\bchampionship\b",
             r"\bplayoffs\b",   r"\bseason\b",      r"\bdrafted\b",    r"\btraded\b",

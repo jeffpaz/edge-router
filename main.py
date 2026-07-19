@@ -146,6 +146,51 @@ def _cache_put(query: str, data: dict, skill: str, confidence: float) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Conversation history  (in-memory, keyed by session_id, max 50 sessions,
+# evict oldest; each session capped at the last 10 messages / 5 turns)
+# ---------------------------------------------------------------------------
+
+_SESSION_MAX_SESSIONS = 50
+_SESSION_MAX_MESSAGES = 10  # 5 turns
+
+_sessions: OrderedDict[str, list[dict]] = OrderedDict()
+
+
+def _trim_messages(messages: list) -> list:
+    """Keep only the most recent _SESSION_MAX_MESSAGES entries, oldest trimmed first."""
+    return messages[-_SESSION_MAX_MESSAGES:] if messages else []
+
+
+def _session_context(session_id: str | None, messages: list) -> list:
+    """Trimmed conversation history for this turn.
+
+    Client-sent messages win when present (the frontend already tracks its own
+    history); server-stored session history is the fallback for clients that
+    only send session_id.
+    """
+    if messages:
+        return _trim_messages(messages)
+    if session_id and session_id in _sessions:
+        return _trim_messages(_sessions[session_id])
+    return []
+
+
+def _session_update(session_id: str | None, query: str, answer: str) -> None:
+    """Append this turn to the session's history, evicting the oldest session past the cap."""
+    if not session_id or not answer:
+        return
+    history = _sessions.get(session_id, [])
+    history = history + [
+        {"role": "user", "content": query},
+        {"role": "assistant", "content": answer},
+    ]
+    _sessions[session_id] = _trim_messages(history)
+    _sessions.move_to_end(session_id)
+    while len(_sessions) > _SESSION_MAX_SESSIONS:
+        _sessions.popitem(last=False)
+
+
+# ---------------------------------------------------------------------------
 # Billing probe cache  (5-minute TTL — avoids burning quota on status checks)
 # ---------------------------------------------------------------------------
 
@@ -594,6 +639,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
                 "tokens":           tokens.model_dump(),
                 "status":           "cache_hit",
             })
+            _session_update(req.session_id, req.query, cached["answer"])
             return QueryResponse(
                 answer=cached["answer"],
                 source=cached["source"],
@@ -607,6 +653,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
             )
 
     skill = _router.skill_router.classify(req.query)
+    context_messages = _session_context(req.session_id, req.messages)
 
     try:
         # ── Realtime intent bypass — skips local LLM for sports/news/price ──────
@@ -619,7 +666,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
             if selected:
                 _routing_reason = f"realtime_intent signals={_rt.signals}"
                 try:
-                    rt_cloud = await cloud_llms.query(selected, req.query, req.system, messages=req.messages)
+                    rt_cloud = await cloud_llms.query(selected, req.query, req.system, messages=context_messages)
                     total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
                     tokens   = TokenBreakdown(
                         input=rt_cloud.input_tokens,
@@ -651,6 +698,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
                             "routing_reason": _routing_reason,
                         },
                     )
+                    _session_update(req.session_id, req.query, rt_cloud.answer)
                     return QueryResponse(
                         answer=rt_cloud.answer,
                         source=rt_cloud.provider,
@@ -675,7 +723,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
                     # Fall through to normal local->cloud routing
 
         if req.force_cloud:
-            cloud = await _router.skill_router.dispatch(req.query, skill, req.system, req.messages)
+            cloud = await _router.skill_router.dispatch(req.query, skill, req.system, context_messages)
             total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
             tokens   = TokenBreakdown(
                 input=cloud.input_tokens,
@@ -709,6 +757,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
                     "status":           status,
                 },
             )
+            _session_update(req.session_id, req.query, cloud.answer)
             return QueryResponse(
                 answer=cloud.answer,
                 source=cloud.provider,
@@ -721,7 +770,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
             )
 
         # ── Local-first / escalate — shared with /query/stream ───────────────
-        result = await _resolve_query(req.query, req.system, req.messages, skill, req_id=req_id)
+        result = await _resolve_query(req.query, req.system, context_messages, skill, req_id=req_id)
         total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
         tokens   = TokenBreakdown(
             input=result.input_tokens,
@@ -766,6 +815,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
                 "status":           status,
             },
         )
+        _session_update(req.session_id, req.query, result.answer)
         return QueryResponse(
             answer=result.answer,
             source=result.source,
@@ -912,6 +962,7 @@ async def query_stream_endpoint(req: QueryRequest):
                 "cache_hit":         True,
             }
             yield f"data: {json.dumps({'token': '', 'done': True, 'metadata': metadata})}\n\n"
+            _session_update(req.session_id, req.query, cached["answer"])
         return StreamingResponse(
             cached_stream(),
             media_type="text/event-stream",
@@ -919,6 +970,7 @@ async def query_stream_endpoint(req: QueryRequest):
         )
 
     skill = _router.skill_router.classify(req.query)
+    context_messages = _session_context(req.session_id, req.messages)
 
     # Realtime intent — route to cloud and fake-stream the response for UX continuity
     _rt_s = classify_intent(req.query)
@@ -930,15 +982,16 @@ async def query_stream_endpoint(req: QueryRequest):
             _signals = _rt_s.signals
             async def realtime_cloud_stream():
                 try:
-                    cloud = await cloud_llms.query(selected, req.query, req.system, messages=req.messages)
+                    cloud = await cloud_llms.query(selected, req.query, req.system, messages=context_messages)
                     async for chunk in _fake_stream_text(cloud.answer):
                         yield chunk
                     yield f"data: {json.dumps({'token': '', 'done': True, 'metadata': {'routed_to': cloud.provider, 'source': cloud.provider, 'model_used': cloud.model, 'skill': skill, 'confidence_score': None, 'latency_ms': cloud.latency_ms, 'tokens': {'input': cloud.input_tokens, 'output': cloud.output_tokens, 'total': cloud.input_tokens + cloud.output_tokens}, 'realtime_intent': True, 'realtime_signals': _signals}})}\n\n"
+                    _session_update(req.session_id, req.query, cloud.answer)
                 except Exception as exc:
                     if isinstance(exc, cloud_llms.ProviderError) and _router._is_billing_error(exc):
                         _router._mark_degraded(selected)
                     _log.warning("stream_realtime_failed provider=%s", selected, extra={"provider": selected, "error": str(exc)})
-                    async for chunk in local_llm.generate_stream(req.query, req.system, req.messages, skill=skill):
+                    async for chunk in local_llm.generate_stream(req.query, req.system, context_messages, skill=skill):
                         yield chunk
             return StreamingResponse(
                 realtime_cloud_stream(),
@@ -949,11 +1002,20 @@ async def query_stream_endpoint(req: QueryRequest):
     # Local-only skills never escalate regardless of confidence — stream Ollama live.
     if skill in _router.LOCAL_ONLY_SKILLS:
         async def local_only_stream():
+            answer_parts: list[str] = []
             try:
                 async for chunk in local_llm.generate_stream(
-                    req.query, req.system, req.messages, skill=skill
+                    req.query, req.system, context_messages, skill=skill
                 ):
+                    if chunk.startswith("data: "):
+                        try:
+                            payload = json.loads(chunk[6:])
+                            if payload.get("token"):
+                                answer_parts.append(payload["token"])
+                        except json.JSONDecodeError:
+                            pass
                     yield chunk
+                _session_update(req.session_id, req.query, "".join(answer_parts))
             except Exception as exc:
                 _log.error("stream_error req_id=%s error=%s", req_id, exc)
                 yield f"data: {json.dumps({'error': True, 'message': str(exc)[:200], 'provider': 'ollama', 'done': True})}\n\n"
@@ -969,7 +1031,7 @@ async def query_stream_endpoint(req: QueryRequest):
     # streaming for a routing decision that matches /query exactly. A heartbeat
     # keeps the connection alive while _resolve_query() runs.
     async def routed_stream():
-        task = asyncio.ensure_future(_resolve_query(req.query, req.system, req.messages, skill, req_id=req_id))
+        task = asyncio.ensure_future(_resolve_query(req.query, req.system, context_messages, skill, req_id=req_id))
         try:
             async for heartbeat in _heartbeat_until_done(task):
                 yield heartbeat
@@ -982,6 +1044,7 @@ async def query_stream_endpoint(req: QueryRequest):
         async for chunk in _fake_stream_text(result.answer):
             yield chunk
         yield f"data: {json.dumps({'token': '', 'done': True, 'metadata': _stream_metadata(result, skill, t_wall)})}\n\n"
+        _session_update(req.session_id, req.query, result.answer)
 
         if result.source == "local":
             _cache_put(req.query, {
