@@ -55,6 +55,14 @@ The `/query` response includes `realtime_intent: true` and a `realtime_signals` 
 
 ---
 
+## Conversation history
+
+Both endpoints accept an optional `messages` array (`[{"role": "user"|"assistant", "content": "..."}]`) so follow-ups like "scale that recipe for 20 people" resolve against prior turns instead of being answered cold. Client-sent `messages` win when present; `main.py` also keeps a server-side session store (`_sessions`, keyed by `session_id`, max 50 sessions with oldest evicted first) as a fallback for clients that only send `session_id` with an empty `messages` array. Either source is trimmed to the last 10 messages (5 turns) before being used, to bound prompt size — see `_session_context()` / `_session_update()` in `main.py`.
+
+For the local model, history is flattened into the prompt text (`local_llm.py`: `"Previous conversation:\n..."` prepended before the current question). Cloud providers receive it as a native messages array in each SDK's own format (Anthropic/OpenAI-style `role`/`content` objects, or Gemini's `parts` shape).
+
+---
+
 ## Setup on Nvidia Jetson Orin Nano
 
 ### 1. Flash JetPack 6.x
@@ -198,14 +206,19 @@ sudo journalctl -u edge-router -f
 | `GROK_MODEL` | `grok-3-mini` | xAI model override |
 | `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI model override |
 
-Skill → cloud LLM mapping (fixed in `router.py`):
+Skill → cloud LLM mapping (fixed in `router.py`'s `_SKILL_MAP`):
 
 | Skill | Provider | Model |
 |---|---|---|
 | `coding` | Claude | `claude-sonnet-4-20250514` |
-| `math_data` | Gemini | `gemini-1.5-pro` |
-| `current_events` | Grok | `grok-2-latest` |
+| `math_data` | Gemini | `gemini-2.0-flash` |
+| `current_events` | Grok | `GROK_MODEL` default |
+| `sports_people` | Grok | `GROK_MODEL` default |
 | `general` | OpenAI | `gpt-4o` |
+
+`math_data`, `current_events`, and `sports_people` have their `SKILL_THRESHOLDS` set to `1.0` in `config.py` — they always escalate regardless of local confidence.
+
+The `sports_people` classifier requires generic sport names (`golf`, `tennis`, `soccer`, `hockey`, `basketball`, `football`, `baseball`) to appear alongside an actual sports-context signal (`team`, `score`, `won`, `league`, a league acronym, etc.) elsewhere in the query — see `_sport_pattern()` in `router.py`. Without this, a bare sport name matched on its own regardless of context (e.g. "write a poem about golf" was misclassified as `sports_people` and escalated to Grok purely because it contained the word "golf", instead of being classified `creative` and answered locally).
 
 ## API
 
@@ -215,7 +228,9 @@ Skill → cloud LLM mapping (fixed in `router.py`):
 |---|---|---|---|
 | `query` | string | yes | User query text |
 | `force_cloud` | bool | no | Skip local model, go straight to cloud (default `false`) |
-| `system` | string | no | System prompt forwarded to whichever LLM answers |
+| `system` | string | no | System prompt forwarded to whichever LLM answers. Local model falls back to a default formatting-guidance prompt (blank lines between paragraphs/stanzas, one list item per line) when this is omitted — see `_DEFAULT_FORMAT_SYSTEM_PROMPT` in `local_llm.py`. |
+| `session_id` | string | no | Client-chosen session identifier. Used to key the server-side conversation history fallback (see "Conversation history" above) and returned unchanged in the response. |
+| `messages` | array | no | Prior turns as `[{"role": "user"|"assistant", "content": "..."}]`. Trimmed to the last 10 before use. |
 
 Response:
 
@@ -226,8 +241,13 @@ Response:
 | `model_used` | string | Exact model ID that answered |
 | `skill` | string | Classified query type |
 | `latency_ms` | float | Total wall-clock time for the request |
-| `local_confidence` | float\|null | Confidence score from local model; null when `force_cloud=true` |
-| `tokens_used` | int | Total tokens consumed |
+| `confidence_score` | float\|null | Local model confidence; null when `force_cloud=true` or the realtime bypass answered |
+| `tokens` | object | `{input, output, total}` token breakdown |
+| `session_id` | string\|null | Echoes the request's `session_id` |
+| `cache_hit` | bool | `true` when served from the in-memory answer cache instead of running inference |
+| `realtime_intent` | bool | `true` when the realtime bypass (sports/news/price) answered instead of the normal local/cloud path |
+| `realtime_signals` | array | Signal names that triggered the realtime bypass, if any |
+| `routing_reason` | string\|null | Set for realtime-bypass responses; explains why that path was taken |
 
 
 ### `POST /query/stream`
@@ -252,7 +272,7 @@ cloud escalation):
   "metadata": {
     "routed_to": "local",
     "source": "local",
-    "model_used": "gemma2:2b",
+    "model_used": "llama3.2:3b",
     "skill": "general",
     "confidence_score": 0.7967,
     "latency_ms": 1234,
