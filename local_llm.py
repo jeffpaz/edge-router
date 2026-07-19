@@ -13,6 +13,22 @@ _log = logging.getLogger("edge_router.local_llm")
 
 
 # ---------------------------------------------------------------------------
+# Default formatting guidance — Ollama returns valid single-newline-separated
+# text (soft line breaks), which markdown renderers collapse to spaces
+# without CSS help. Nudging the model toward blank-line paragraph/stanza
+# breaks reduces reliance on that CSS handling. Only used when the caller
+# doesn't supply their own system prompt, so it never overrides one.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_FORMAT_SYSTEM_PROMPT = (
+    "You are a helpful assistant. Format your responses clearly: leave a "
+    "blank line between paragraphs, put each line of a poem on its own line "
+    "with a blank line between stanzas, and put each list or recipe step on "
+    "its own line."
+)
+
+
+# ---------------------------------------------------------------------------
 # Signal 1: Token log-probabilities  (Ollama /api/generate, logprobs=true)
 # ---------------------------------------------------------------------------
 
@@ -339,7 +355,7 @@ async def query(prompt: str, system: str = "", messages: list = [], skill: str =
     try:
         raw_text, logprobs, prompt_tokens, completion_tokens = await _generate(
             prompt=full_prompt + _SELF_RATE_SUFFIX,
-            system=system,
+            system=system or _DEFAULT_FORMAT_SYSTEM_PROMPT,
             skill=skill,
         )
     except httpx.HTTPStatusError as exc:
@@ -516,8 +532,7 @@ async def generate_stream(
             "num_thread":     6,
         },
     }
-    if system:
-        payload["system"] = system
+    payload["system"] = system or _DEFAULT_FORMAT_SYSTEM_PROMPT
 
     received_tokens = False
     t_start = time.monotonic()
