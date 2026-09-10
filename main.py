@@ -19,7 +19,10 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Receive, Scope, Send
 
+import auth
 import cloud_llms
 import config
 import local_llm
@@ -424,6 +427,79 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ---------------------------------------------------------------------------
+# Middleware
+# ---------------------------------------------------------------------------
+# Starlette applies add_middleware() so the LAST call wraps outermost. CORS is
+# added last on purpose: it must see the 401s the auth layer returns (to attach
+# CORS headers), and it answers preflight OPTIONS before auth ever runs.
+
+_AUTH_PROTECTED_PREFIXES = ("/query",)
+
+
+class FirebaseAuthMiddleware:
+    """Verifies `Authorization: Bearer <firebase-id-token>` on /query* routes.
+
+    Pure-ASGI (not BaseHTTPMiddleware) so it never buffers or touches the
+    response body — required for the /query/stream SSE endpoint. Governed by
+    config:
+      AUTH_ENABLED=false                → no-op, every request passes through
+      AUTH_ENABLED, AUTH_REQUIRED=false → verify + log only, still pass through
+      AUTH_ENABLED, AUTH_REQUIRED=true  → reject missing/invalid token with 401
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not config.AUTH_ENABLED:
+            await self.app(scope, receive, send)
+            return
+
+        path: str = scope["path"]
+        if scope["method"] == "OPTIONS" or not path.startswith(_AUTH_PROTECTED_PREFIXES):
+            await self.app(scope, receive, send)
+            return
+
+        token = auth.bearer_token(Headers(scope=scope).get("authorization", ""))
+        rejection: str | None = None
+        claims: dict[str, Any] | None = None
+
+        if not token:
+            rejection = "Missing bearer token."
+        else:
+            try:
+                claims = await auth.verify_token(token)
+            except auth.AuthError as exc:
+                rejection = exc.detail
+            except Exception as exc:  # never let the auth path 500 a request
+                _log.error("auth_internal_error", extra={"error": str(exc)}, exc_info=True)
+                rejection = "Token verification failed."
+
+        if rejection is not None:
+            if config.AUTH_REQUIRED:
+                _log.info("auth_rejected", extra={"path": path, "reason": rejection})
+                await JSONResponse(
+                    status_code=401,
+                    content={"error": "unauthorized", "detail": rejection},
+                    headers={"WWW-Authenticate": "Bearer"},
+                )(scope, receive, send)
+                return
+            _log.warning("auth_soft_reject", extra={"path": path, "reason": rejection})
+        elif claims is not None:
+            _log.info(
+                "auth_ok",
+                extra={
+                    "path": path,
+                    "uid": claims.get("user_id") or claims.get("sub"),
+                    "email": claims.get("email"),
+                },
+            )
+
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(FirebaseAuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

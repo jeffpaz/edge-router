@@ -52,3 +52,18 @@ RETRY_ENABLED = os.getenv("RETRY_ENABLED", "true").lower() == "true"
 # Which cloud LLM to fall back to when local confidence is low.
 # Options: "claude", "gemini", "grok", "openai"
 FALLBACK_PROVIDER = os.getenv("FALLBACK_PROVIDER", "claude")
+
+# ── Firebase ID token verification (see auth.py) ─────────────────────────────
+# The Firebase project whose ID tokens are accepted. Clients: AskJetson (iOS)
+# and the pazlabs.io web app both use project "pazlabs-933bf".
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "pazlabs-933bf")
+
+# Master switch. When false the auth middleware is a complete no-op — every
+# request passes through exactly as before.
+AUTH_ENABLED = os.getenv("AUTH_ENABLED", "false").lower() == "true"
+
+# When true, /query and /query/stream reject a missing or invalid token with
+# 401. When false (but AUTH_ENABLED), tokens are still verified and the result
+# is logged, but the request is allowed through regardless — a safe observation
+# window before flipping enforcement on.
+AUTH_REQUIRED = os.getenv("AUTH_REQUIRED", "false").lower() == "true"
