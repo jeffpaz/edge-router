@@ -35,7 +35,8 @@ GEMINI_MODELS    = [m.strip() for m in os.getenv(
     "TRIPBUDDY_GEMINI_MODELS", "gemini-3.8-flash,gemini-3.5-flash").split(",") if m.strip()]
 GEMINI_GROUNDING = os.getenv("TRIPBUDDY_GEMINI_GROUNDING", "false").lower() == "true"
 
-GROK_MODEL       = os.getenv("TRIPBUDDY_GROK_MODEL", "grok-4-fast")
+GROK_MODEL       = os.getenv("TRIPBUDDY_GROK_MODEL", "grok-4.20-0309-non-reasoning")
+GEMINI_TIMEOUT_S = float(os.getenv("TRIPBUDDY_GEMINI_TIMEOUT_S", "30"))
 
 GEMINI_DAILY_CAP = int(os.getenv("TRIPBUDDY_GEMINI_DAILY_CAP", "100"))
 GROK_DAILY_CAP   = int(os.getenv("TRIPBUDDY_GROK_DAILY_CAP", "25"))
@@ -190,7 +191,15 @@ async def query_gemini(prompt: str, system: str, json_output: bool, json_schema:
     from google import genai
     from google.genai import errors, types
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    # One attempt per model with a hard timeout: on 503/429 we fail over (next model, then Grok)
+    # in seconds instead of sitting in the SDK's own backoff for minutes.
+    client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=types.HttpOptions(
+            timeout=int(GEMINI_TIMEOUT_S * 1000),
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
     cfg: dict = {"system_instruction": system or None, "temperature": 0.3}
     if GEMINI_GROUNDING:
         # Structured output can't be combined with tools; JSON comes from the prompt instead.
