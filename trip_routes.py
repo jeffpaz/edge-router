@@ -28,7 +28,7 @@ _log = logging.getLogger("edge_router.trip")
 
 router = APIRouter(prefix="/trip", tags=["tripBuddy"])
 
-SubIntent = Literal["plan_edit", "place", "directions", "event", "factcheck"]
+SubIntent = Literal["plan_edit", "place", "directions", "event", "factcheck", "expense"]
 
 # ---------------------------------------------------------------------------
 # Trip sub-classifier — only ever runs on /trip/query
@@ -77,7 +77,20 @@ _DESTINATIONS: dict[str, list[str]] = {
     "directions": ["gemini", "grok", "local"],
     "event":      ["grok", "local"],
     "factcheck":  ["grok", "local"],
+    "expense":    ["local"],   # money stays on the home lab: never Gemini or Grok
 }
+
+# Expense privacy guard (tripBuddy Phase 6.4): a member's message that pairs a money amount with an
+# expense verb ("Victor paid $48 for Uber", "I paid 212.40 for the Airbnb, split 4 ways") is routed
+# to the local model only, whatever sub-intent or local_only flag the caller sent. Checked on the
+# member's message (classify_text), or on the query when there is none.
+_MONEY = re.compile(r"(\$\s?\d|\b\d+(?:[.,]\d{2})\b|\b\d+\s?(?:dollars|bucks|usd)\b)", re.I)
+_EXPENSE_VERB = re.compile(r"\b(paid|pay|pays|paying|split|splitting|owe[sd]?|spent|spend|covered|cover|venmo(?:ed)?|"
+                           r"reimburse[sd]?|chipped in|fronted|bought|charged|cost)\b", re.I)
+
+
+def is_expense_text(text: str | None) -> bool:
+    return bool(text) and bool(_MONEY.search(text)) and bool(_EXPENSE_VERB.search(text))
 
 
 def classify_trip(query: str) -> tuple[str, dict[str, int]]:
@@ -152,7 +165,10 @@ async def trip_query(
     else:
         sub_intent, scores = classify_trip(req.classify_text or req.query)
 
-    chain = ["local"] if req.local_only else list(_DESTINATIONS[sub_intent])
+    expense_guard = sub_intent == "expense" or is_expense_text(req.classify_text or req.query)
+    chain = ["local"] if (req.local_only or expense_guard) else list(_DESTINATIONS[sub_intent])
+    if expense_guard and not req.local_only:
+        _log.info("trip_expense_guard", extra={"sub_intent": sub_intent})
     attempted: list[str] = []
     reasons: list[str] = []
     capped: list[str] = []
