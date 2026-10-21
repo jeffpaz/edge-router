@@ -38,6 +38,7 @@ services:
     # interpolation scope so the environment: block below can reference them.
     env_file:
       - .env
+      - /etc/pazbrain.env    # PazBrain tokens + email allowlist (chmod 600)
 
     environment:
       # ── Name translation ─────────────────────────────────────────────────────
@@ -72,6 +73,7 @@ services:
       - /mnt:/host_mnt:ro
       - /var/run/docker.sock:/var/run/docker.sock
       - /home/jeffpaz/edge-router/data:/app/data
+      - /home/jeffpaz/pazbrain:/opt/pazbrain   # PazBrain wiki git repo + index.db
 
     depends_on:
       - ollama
