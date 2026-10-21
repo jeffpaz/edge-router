@@ -1,0 +1,3 @@
+#!/bin/sh
+# PazBrain Grok writer (runs in the PazBrain venv). See /opt/pazbrain/bin/pazbrain_grok.py
+exec /opt/pazbrain/venv/bin/python /opt/pazbrain/bin/pazbrain_grok.py "$@"

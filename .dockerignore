@@ -32,3 +32,7 @@ deploy.sh
 *.swo
 .idea/
 .vscode/
+
+# PazBrain host-side tools (run on the Jetson, not in the edge-router image)
+pazbrain/scripts/
+pazbrain/systemd/

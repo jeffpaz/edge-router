@@ -1,0 +1,19 @@
+[Unit]
+Description=PazBrain Drive sync (Google Drive pazbrain/ -> PazBrain wiki, read-only on Drive)
+Documentation=file:///opt/pazbrain/bin/pazbrain_sync.py
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jeffpaz
+Group=jeffpaz
+EnvironmentFile=/etc/pazbrain.env
+# rclone reads ~/.config/rclone/rclone.conf
+Environment=HOME=/home/jeffpaz
+ExecStart=/opt/pazbrain/venv/bin/python /opt/pazbrain/bin/pazbrain_sync.py
+TimeoutStartSec=20min
+Nice=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
