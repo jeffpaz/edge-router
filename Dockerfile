@@ -12,6 +12,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# git for PazBrain (pazbrain/store.py commits every wiki write). After the pip layer
+# so adding it doesn't invalidate the cached dependency install.
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
 # ── Layer 2: application source ───────────────────────────────────────────────
 COPY --chown=appuser:appuser . .
 

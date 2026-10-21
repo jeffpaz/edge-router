@@ -1572,3 +1572,13 @@ async def argus_proxy(path: str, request: Request) -> Response:
         return JSONResponse(status_code=503, content={"error": "Argus backend unreachable"})
     except httpx.TimeoutException:
         return JSONResponse(status_code=504, content={"error": "Argus backend timeout"})
+
+
+# tripBuddy: POST /trip/query, GET /trip/usage (additive; see trip_routes.py)
+import trip_routes  # noqa: E402
+app.include_router(trip_routes.router)
+
+# PazBrain private wiki API at /brain/api — a mounted sub-app with its own auth,
+# OpenAPI schema and error handling (additive; see pazbrain/routes.py)
+import pazbrain.routes  # noqa: E402
+app.mount("/brain/api", pazbrain.routes.app)
