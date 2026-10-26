@@ -1739,3 +1739,8 @@ app.include_router(trip_routes.router)
 # OpenAPI schema and error handling (additive; see pazbrain/routes.py)
 import pazbrain.routes  # noqa: E402
 app.mount("/brain/api", pazbrain.routes.app)
+
+# PazBrain read-only Logseq queries at POST /brain/query, same read auth; the CLI runs on the host
+# behind a unix socket (additive; see pazbrain/query_routes.py)
+import pazbrain.query_routes  # noqa: E402
+app.include_router(pazbrain.query_routes.router)

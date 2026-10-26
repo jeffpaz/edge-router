@@ -41,6 +41,8 @@ MIRROR = Path("/opt/pazbrain/drive-mirror")
 STATE_DB = Path("/opt/pazbrain/sync_state.db")
 LOG_FILE = Path("/opt/pazbrain/logs/sync.log")
 LOCK_FILE = Path("/opt/pazbrain/sync.lock")
+LOGSEQ_INGEST = Path("/opt/pazbrain/logseq_ingest.py")
+LOGSEQ_TIMEOUT_S = 600
 
 UPDATED_BY = "grok-app"
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,80}$")  # same rule as pazbrain/store.py
@@ -242,6 +244,22 @@ def process_file(api: API | None, rel: str, path: Path, dry_run: bool) -> tuple[
     return "error", slug, f"PUT {st} {resp.get('error', '')}".strip()
 
 
+def logseq_ingest() -> str:
+    """Mirror the wiki into the Logseq "pazbrain" graph. Never fails the sync; returns a status label.
+    logseq_ingest.py stops the db-worker-node daemon at the end if it started it."""
+    if not LOGSEQ_INGEST.exists():
+        return "absent"
+    try:
+        proc = subprocess.run([sys.executable, str(LOGSEQ_INGEST)], capture_output=True, text=True,
+                              timeout=LOGSEQ_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return f"timeout after {LOGSEQ_TIMEOUT_S}s"
+    except Exception as exc:  # the wiki sync must never fail because of Logseq
+        return f"failed to run ({type(exc).__name__})"
+    last = (proc.stdout.strip().splitlines() or [""])[-1]
+    return (last.removeprefix("logseq_ingest: ") or "no summary") + ("" if proc.returncode == 0 else f" (exit {proc.returncode})")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="pazbrain_sync.py", description=__doc__.split("\n\n")[0])
     ap.add_argument("--dry-run", action="store_true", help="sync the mirror and print planned API calls; send no writes")
@@ -329,6 +347,9 @@ def main() -> int:
             summary["deletions_page"] = api.note(
                 DELETIONS_PAGE, "Sync deletions",
                 "Pages whose Drive file was deleted; review and archive by hand", deletions)
+            # Every run, not only when this sync wrote: the wiki also changes through other API writers.
+            summary["logseq"] = logseq_ingest()
+            print(f"pazbrain_sync: logseq {summary['logseq']}", file=sys.stderr)
         conn.close()
         return exit_code
     except Exception as exc:  # summarise, never dump content

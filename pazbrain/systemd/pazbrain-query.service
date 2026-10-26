@@ -1,0 +1,20 @@
+[Unit]
+Description=PazBrain query sidecar (read-only Logseq CLI on a unix socket for edge-router /brain/query)
+Documentation=file:///opt/pazbrain/bin/brain_query.py
+After=network.target
+
+[Service]
+Type=simple
+User=jeffpaz
+Group=jeffpaz
+Environment=HOME=/home/jeffpaz
+ExecStart=/opt/pazbrain/venv/bin/python /opt/pazbrain/bin/brain_query.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes
+# Stopping the service also stops the db-worker-node daemon it keeps warm (same cgroup).
+
+[Install]
+WantedBy=multi-user.target
