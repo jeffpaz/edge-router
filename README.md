@@ -3,7 +3,7 @@
 Routes LLM queries to a **local Ollama model** first. If the response confidence falls below a configurable threshold, the query is automatically escalated to a cloud provider (Claude, Gemini, Grok, or OpenAI).
 
 ```
-POST /query  (or /query/stream)
+POST /query  (or /query/stream, /ask/stream)
   │
   ├─ realtime_classifier ──is_realtime──► cloud LLM (Grok/OpenAI) ──► return
   │
@@ -28,13 +28,31 @@ trade for a routing decision that's guaranteed to match `/query`. A heartbeat ev
 is sent periodically while `_resolve_query()` is running so the connection doesn't
 idle out on a slow local pass. Both endpoints also share the same response cache.
 
+`/ask/stream` (used by the pazlabs.io web chat) also routes through `_resolve_query()`,
+but plugs in `local_llm.query_streaming()` so every local pass, the retry included,
+streams token by token. Alongside the tokens it sends live Jetson telemetry from a
+per-request tegrastats sampler, and each Ollama call's own load/prefill/decode
+timings. If the answer escalates to cloud, a `replace` event swaps the cloud
+answer in for the local text. See [`POST /ask/stream`](#post-askstream).
+
+Every Ollama call (all three endpoints, the retry pass, the keep-alive ping and the
+startup warm-up) sends the same runner options (`num_ctx` 4096, `num_thread` 6) and
+`keep_alive: -1`. Ollama reloads the model whenever a runner option differs from the
+loaded runner, so this one shared set is what keeps follow-up queries from paying the
+~6s load again. `num_predict` still varies by skill; it's a sampling option and never
+triggers a reload.
+
 ## Project layout
 
 ```
 edge-router/
-├── main.py                FastAPI app, /query, /query/stream, /health endpoints
+├── main.py                FastAPI app: /query, /query/stream, /ask/stream, /health, monitoring endpoints
 ├── router.py              Skill classifier + routing logic
 ├── local_llm.py           Ollama client with confidence scoring and SSE streaming
+├── telemetry.py           Per-request tegrastats sampler + KV estimate for /ask/stream
+├── auth.py                Firebase ID token verification (dormant unless AUTH_ENABLED)
+├── trip_routes.py         tripBuddy trip-planning endpoint (+ providers_trip.py)
+├── pazbrain/              PazBrain wiki API (/brain/api), read-only Logseq queries (/brain/query), host scripts
 ├── cloud_llms.py          Clients for Claude, Gemini, Grok, OpenAI
 ├── realtime_classifier.py Real-time intent detector (sports/stocks/news bypass)
 ├── config.py              API keys and settings from environment variables
@@ -205,6 +223,11 @@ sudo journalctl -u edge-router -f
 | `GEMINI_MODEL` | `gemini-2.0-flash` | Google model override |
 | `GROK_MODEL` | `grok-3-mini` | xAI model override |
 | `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI model override |
+| `PAZBRAIN_QUERY_RATE_PER_MIN` | `30` | Per-caller rate limit for `POST /brain/query` |
+
+The Ollama runner options (`num_ctx` 4096, `num_thread` 6) and `keep_alive: -1` are fixed
+in `local_llm.py` (`_RUNNER_OPTIONS`, `KEEP_ALIVE`), not read from the environment, so no
+call can drift from the others. `config.OLLAMA_NUM_CTX` is not used by the local client.
 
 Skill → cloud LLM mapping (fixed in `router.py`'s `_SKILL_MAP`):
 
@@ -295,6 +318,52 @@ the answer came from the shared response cache instead of running inference at a
 no local inference ran.
 
 On error, a single event is emitted instead: `data: {"error": true, "message": "...", "provider": "ollama", "done": true}`.
+
+### `POST /ask/stream`
+
+Same request body and routing as `/query/stream`, but the local passes stream live and
+the response uses **named** SSE events (`event: <kind>` followed by `data: <json>`):
+
+| Event | Data | When |
+|---|---|---|
+| `call` | `{call, label, t}` | An Ollama call starts; `label` is `local` or `retry` |
+| `token` | `{text}` | Live answer text |
+| `metrics` | `{t, cpu, gpu, ram, tok, tps, kv, n}` | About 8/s for the whole request |
+| `phases` | `{call, label, load, prefill, decode, total, prompt_eval_count, eval_count, wall, t_start}` | Once per Ollama call, from its final chunk (times in seconds) |
+| `replace` | `{text, source?}` | Replace the answer text: a retry starts (`""`), the self-rating tag is stripped from the final local answer, or a cloud/cached answer arrives |
+| `done` | `{metadata, wall}` | Final; `metadata` has the same shape as `/query/stream`'s done frame |
+| `error` | `{message}` | Instead of `done` |
+
+`metrics` fields:
+- `t`: seconds since the request started.
+- `cpu`: mean of the online cores, %.
+- `gpu`: `GR3D_FREQ`, %.
+- `ram`: MB used.
+- `tok`: cumulative output tokens across all calls.
+- `tps`: tokens over the trailing second.
+- `kv`: KV-cache bytes for the current call, estimated as `(prompt tokens + tokens so far) × 2 × layers × kv_heads × head_dim × 2` (f16). Prompt tokens are counted at about 4 characters each until Ollama reports `prompt_eval_count`. `kv` is `null` for models missing from `telemetry.MODEL_SPECS`.
+- `n`: tegrastats samples read.
+
+Each request runs its own `tegrastats --interval 125` subprocess, which is killed when
+the response ends, including when the client disconnects.
+
+### `POST /brain/query`
+
+Read-only queries over the PazBrain Logseq graph. Requires the same auth as
+`/brain/api` reads (a read token, a write token, or an allowlisted Firebase ID token).
+The body is one of six operations, chosen by `op`:
+- `search_page {q}`
+- `search_block {q}`
+- `show_page {slug, level 1-3}`
+- `list_task {status?, limit ≤50}`
+- `recent_updated {days ≤90}`
+- `task_search {status, title?, days}`
+
+Each caller is rate limited (`PAZBRAIN_QUERY_RATE_PER_MIN`, default 30/min; `429` with
+`Retry-After` beyond that). The container has no logseq CLI. Requests are forwarded over
+`/opt/pazbrain/run/brain-query.sock` to the host sidecar `pazbrain/scripts/brain_query.py`
+(`pazbrain-query.service`). The sidecar validates again, runs only fixed CLI argument
+lists (no shell, no write operations, no raw datalog), and caps result sizes.
 
 ### `GET /health`
 
