@@ -17,7 +17,7 @@ services:
       OLLAMA_HOST: 0.0.0.0
       OLLAMA_FLASH_ATTENTION: 1
       OLLAMA_KV_CACHE_TYPE: q4_0
-      OLLAMA_KEEP_ALIVE: 1h
+      OLLAMA_KEEP_ALIVE: "-1"     # never unload; edge-router also sends keep_alive: -1 per request
       OLLAMA_GPU_LAYERS: "999"
     volumes:
       - /mnt/models/ollama:/models

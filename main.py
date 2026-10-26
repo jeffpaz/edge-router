@@ -27,6 +27,7 @@ import cloud_llms
 import config
 import local_llm
 import router as _router
+import telemetry
 from realtime_classifier import classify as classify_intent
 
 
@@ -401,10 +402,18 @@ async def lifespan(app: FastAPI):
         _log.warning("ollama_unreachable", extra={"error": str(exc)})
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        # A cold load of the model on the Jetson takes ~6s+; give it room so the
+        # first real query finds the model resident.
+        async with httpx.AsyncClient(timeout=60.0) as client:
             await client.post(
                 f"{config.OLLAMA_BASE_URL}/api/generate",
-                json={"model": config.OLLAMA_MODEL, "keep_alive": "10m"},
+                # Same runner options as every real call, so the warm-up load is
+                # the one later queries reuse instead of triggering a reload.
+                json={
+                    "model":      config.OLLAMA_MODEL,
+                    "keep_alive": local_llm.KEEP_ALIVE,
+                    "options":    local_llm._RUNNER_OPTIONS,
+                },
             )
         _log.info("ollama_warmup_sent")
     except Exception as exc:
@@ -434,11 +443,11 @@ app = FastAPI(
 # added last on purpose: it must see the 401s the auth layer returns (to attach
 # CORS headers), and it answers preflight OPTIONS before auth ever runs.
 
-_AUTH_PROTECTED_PREFIXES = ("/query",)
+_AUTH_PROTECTED_PREFIXES = ("/query", "/ask")
 
 
 class FirebaseAuthMiddleware:
-    """Verifies `Authorization: Bearer <firebase-id-token>` on /query* routes.
+    """Verifies `Authorization: Bearer <firebase-id-token>` on /query* and /ask* routes.
 
     Pure-ASGI (not BaseHTTPMiddleware) so it never buffers or touches the
     response body — required for the /query/stream SSE endpoint. Governed by
@@ -594,15 +603,21 @@ class _ResolvedQuery:
     cloud_latency_ms: float | None = None
 
 
-async def _resolve_query(query: str, system: str, messages: list, skill: str, req_id: str = "") -> _ResolvedQuery:
+async def _resolve_query(
+    query: str, system: str, messages: list, skill: str, req_id: str = "",
+    local_query=local_llm.query,
+) -> _ResolvedQuery:
     """Run the local model, then decide whether to return it or escalate to cloud.
 
     Local-only skills and confident local answers return immediately. general/coding
     get one local-first retry with a simplified query before escalating. Everything
     else escalates to the skill-matched cloud LLM via SkillRouter.dispatch(), which
     never raises.
+
+    `local_query` is local_llm.query by default; /ask/stream passes a wrapper
+    around local_llm.query_streaming so each local pass streams live.
     """
-    local = await local_llm.query(query, system, messages, skill=skill)
+    local = await local_query(query, system, messages, skill=skill)
     _log.info(
         "local_inference",
         extra={
@@ -641,7 +656,7 @@ async def _resolve_query(query: str, system: str, messages: list, skill: str, re
                 "local_retry_attempt",
                 extra={"req_id": req_id, "skill": skill, "simplified_preview": simplified[:60]},
             )
-            retry_local = await local_llm.query(simplified, system, messages, skill=skill)
+            retry_local = await local_query(simplified, system, messages, skill=skill)
             if not retry_local["should_escalate"]:
                 _log.info(
                     "local retry succeeded — escalation avoided",
@@ -979,6 +994,23 @@ async def _heartbeat_until_done(task: asyncio.Task, interval: float = 15.0):
             yield f"data: {json.dumps({'token': '', 'done': False})}\n\n"
 
 
+def _cache_local_result(query: str, result: "_ResolvedQuery", skill: str) -> None:
+    if result.source != "local":
+        return
+    _cache_put(query, {
+        "answer":           result.answer,
+        "source":           "local",
+        "model_used":       result.model,
+        "skill":            skill,
+        "confidence_score": result.confidence,
+        "tokens": {
+            "input":  result.input_tokens,
+            "output": result.output_tokens,
+            "total":  result.input_tokens + result.output_tokens,
+        },
+    }, skill, result.confidence)
+
+
 def _stream_metadata(result: "_ResolvedQuery", skill: str, t_wall: float) -> dict:
     metadata = {
         "routed_to":         result.source,
@@ -1122,19 +1154,7 @@ async def query_stream_endpoint(req: QueryRequest):
         yield f"data: {json.dumps({'token': '', 'done': True, 'metadata': _stream_metadata(result, skill, t_wall)})}\n\n"
         _session_update(req.session_id, req.query, result.answer)
 
-        if result.source == "local":
-            _cache_put(req.query, {
-                "answer":           result.answer,
-                "source":           "local",
-                "model_used":       result.model,
-                "skill":            skill,
-                "confidence_score": result.confidence,
-                "tokens": {
-                    "input":  result.input_tokens,
-                    "output": result.output_tokens,
-                    "total":  result.input_tokens + result.output_tokens,
-                },
-            }, skill, result.confidence)
+        _cache_local_result(req.query, result, skill)
 
     return StreamingResponse(
         routed_stream(),
@@ -1143,6 +1163,143 @@ async def query_stream_endpoint(req: QueryRequest):
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /ask/stream  — /query/stream's routing, with live local tokens and
+# per-request Jetson telemetry for the web "This run" panel
+# ---------------------------------------------------------------------------
+# Named SSE events (`event: <kind>` + `data: <json>`), unlike /query/stream:
+#   call     {call, label, t}             an Ollama call started ("local" | "retry")
+#   token    {text}                       live answer text
+#   metrics  {t, cpu, gpu, ram, tok, tps, kv, n}   ~8/s from a tegrastats sampler
+#   phases   {call, label, load, prefill, decode, total, prompt_eval_count,
+#             eval_count, wall, t_start}  once per Ollama call, from its final chunk
+#   replace  {text, source?}              replace the answer text (retry start,
+#                                         self-rating tag stripped, cloud answer)
+#   done     {metadata, wall}             same metadata as /query/stream's final frame
+#   error    {message}
+
+@app.post("/ask/stream")
+async def ask_stream_endpoint(req: QueryRequest):
+    req_id = uuid.uuid4().hex[:8]
+    t_wall = time.monotonic()
+
+    _log.info(
+        "ask_stream_received",
+        extra={
+            "req_id":        req_id,
+            "session_id":    req.session_id,
+            "query_preview": req.query[:120],
+        },
+    )
+
+    def finish(run: telemetry.Run, answer: str, metadata: dict) -> None:
+        run.emit("metrics", run.metrics())
+        run.emit("done", {"metadata": metadata, "wall": round(run.elapsed(), 3)})
+        _session_update(req.session_id, req.query, answer)
+
+    async def pipeline(run: telemetry.Run) -> None:
+        try:
+            cached = _cache_get(req.query)
+            if cached is not None:
+                run.replace(cached["answer"], source=cached["source"])
+                finish(run, cached["answer"], {
+                    "routed_to":        cached["source"],
+                    "source":           cached["source"],
+                    "model":            cached["model_used"],
+                    "model_used":       cached["model_used"],
+                    "skill":            cached["skill"],
+                    "confidence_score": cached["confidence_score"],
+                    "latency_ms":       round((time.monotonic() - t_wall) * 1000),
+                    "tokens":           cached["tokens"],
+                    "cache_hit":        True,
+                })
+                return
+
+            skill = _router.skill_router.classify(req.query)
+            context_messages = _session_context(req.session_id, req.messages)
+
+            calls = 0
+
+            async def local_query(prompt: str, system: str, messages: list, skill: str) -> dict:
+                nonlocal calls
+                calls += 1
+                return await local_llm.query_streaming(
+                    prompt, system, messages, skill,
+                    run=run, label="local" if calls == 1 else "retry",
+                )
+
+            # Realtime intent goes straight to cloud, as in /query/stream; if that
+            # fails, answer with a single live local pass.
+            _rt_s = classify_intent(req.query)
+            if _rt_s.is_realtime:
+                preferred = _rt_s.preferred_provider
+                available = [p for p in ["grok", "openai", "claude"] if not _router._is_degraded(p)]
+                selected  = preferred if preferred in available else (available[0] if available else None)
+                if selected:
+                    try:
+                        cloud = await cloud_llms.query(selected, req.query, req.system, messages=context_messages)
+                        run.replace(cloud.answer, source=cloud.provider)
+                        finish(run, cloud.answer, {
+                            "routed_to":        cloud.provider,
+                            "source":           cloud.provider,
+                            "model_used":       cloud.model,
+                            "skill":            skill,
+                            "confidence_score": None,
+                            "latency_ms":       cloud.latency_ms,
+                            "tokens": {
+                                "input":  cloud.input_tokens,
+                                "output": cloud.output_tokens,
+                                "total":  cloud.input_tokens + cloud.output_tokens,
+                            },
+                            "realtime_intent":  True,
+                            "realtime_signals": _rt_s.signals,
+                        })
+                        return
+                    except Exception as exc:
+                        if isinstance(exc, cloud_llms.ProviderError) and _router._is_billing_error(exc):
+                            _router._mark_degraded(selected)
+                        _log.warning("ask_realtime_failed provider=%s", selected, extra={"provider": selected, "error": str(exc)})
+                        local = await local_query(req.query, req.system, context_messages, skill)
+                        result = _ResolvedQuery(
+                            source="local", answer=local["answer"], model=local["model"],
+                            confidence=local["confidence"],
+                            input_tokens=local["prompt_tokens"], output_tokens=local["completion_tokens"],
+                        )
+                        run.replace(result.answer, source="local")
+                        finish(run, result.answer, _stream_metadata(result, skill, t_wall))
+                        return
+
+            result = await _resolve_query(
+                req.query, req.system, context_messages, skill,
+                req_id=req_id, local_query=local_query,
+            )
+            run.replace(result.answer, source=result.source)
+            finish(run, result.answer, _stream_metadata(result, skill, t_wall))
+            _cache_local_result(req.query, result, skill)
+        except Exception as exc:
+            _log.error("ask_stream_failed req_id=%s error=%s", req_id, exc, exc_info=True)
+            run.emit("error", {"message": str(exc)[:200]})
+        finally:
+            run.events.put_nowait(None)
+
+    async def event_stream():
+        # Leaving this block — normal end, error, or the client disconnecting —
+        # cancels the pipeline (closing the Ollama stream) and kills tegrastats.
+        async with telemetry.Run(config.OLLAMA_MODEL) as run:
+            task = asyncio.create_task(pipeline(run))
+            try:
+                while (event := await run.events.get()) is not None:
+                    yield event
+            finally:
+                task.cancel()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

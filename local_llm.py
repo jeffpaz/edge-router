@@ -232,18 +232,22 @@ def _combine(
 
 
 # ---------------------------------------------------------------------------
-# Per-skill generation parameters
+# Generation parameters
 # ---------------------------------------------------------------------------
 
-_SKILL_NUM_CTX: dict[str, int] = {
-    "conversational": 2048,
-    "how_to":         2048,
-    "definition":     2048,
-    "opinion_advice": 2048,
-    "creative":       2048,
-    "language_task":  2048,
+# Every Ollama call — /query, /query/stream, /ask/stream, the retry pass and the
+# keep-alive ping — sends these same runner options. Ollama reloads the model
+# whenever num_ctx (or another runner option such as num_thread) differs from
+# the loaded runner, so a single shared value is what keeps follow-up calls
+# from paying the load cost again.
+_NUM_CTX = 4096
+_RUNNER_OPTIONS: dict = {
+    "num_ctx":    _NUM_CTX,
+    "num_thread": 6,
 }
-# Default (coding, general, anything else) → 4096
+
+# Never unload between queries (the Jetson only serves this one model).
+KEEP_ALIVE = -1
 
 _SKILL_NUM_PREDICT: dict[str, int] = {
     "how_to":         600,
@@ -257,6 +261,18 @@ _SKILL_NUM_PREDICT: dict[str, int] = {
 # Default → 300
 
 
+def _options(skill: str) -> dict:
+    """Runner options are fixed; only num_predict (a sampling option, which
+    never triggers a reload) varies by skill."""
+    return {
+        **_RUNNER_OPTIONS,
+        "num_predict":    _SKILL_NUM_PREDICT.get(skill, 300),
+        "temperature":    0.7,
+        "top_p":          0.9,
+        "repeat_penalty": 1.1,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Keep-alive  (prevents model unload between queries on Jetson)
 # ---------------------------------------------------------------------------
@@ -266,7 +282,7 @@ async def _send_keepalive() -> None:
         async with httpx.AsyncClient(timeout=5.0) as client:
             await client.post(
                 f"{config.OLLAMA_BASE_URL}/api/generate",
-                json={"model": config.OLLAMA_MODEL, "keep_alive": "10m"},
+                json={"model": config.OLLAMA_MODEL, "keep_alive": KEEP_ALIVE, "options": _RUNNER_OPTIONS},
             )
     except Exception:
         pass
@@ -276,22 +292,23 @@ async def _send_keepalive() -> None:
 # Ollama call  (/api/generate supports logprobs; /api/chat does not)
 # ---------------------------------------------------------------------------
 
-async def _generate(prompt: str, system: str, skill: str = "general") -> tuple[str, list[float] | None, int, int]:
-    num_ctx     = _SKILL_NUM_CTX.get(skill, 4096)
-    num_predict = _SKILL_NUM_PREDICT.get(skill, 300)
+def _parse_logprobs(raw) -> list[float] | None:
+    """Ollama ≥ 0.2 may return logprobs in one of several shapes."""
+    if isinstance(raw, dict):
+        vals = raw.get("token_logprobs") or raw.get("logprobs") or []
+        return [v for v in vals if isinstance(v, (int, float))] or None
+    if isinstance(raw, list) and raw:
+        return [v for v in raw if isinstance(v, (int, float))] or None
+    return None
 
+
+async def _generate(prompt: str, system: str, skill: str = "general") -> tuple[str, list[float] | None, int, int]:
     payload: dict = {
         "model": config.OLLAMA_MODEL,
         "prompt": prompt,
         "stream": False,
-        "options": {
-            "num_ctx":        num_ctx,
-            "num_predict":    num_predict,
-            "temperature":    0.7,
-            "top_p":          0.9,
-            "repeat_penalty": 1.1,
-            "num_thread":     6,
-        },
+        "keep_alive": KEEP_ALIVE,
+        "options": _options(skill),
         "logprobs": True,
     }
     if system:
@@ -309,14 +326,7 @@ async def _generate(prompt: str, system: str, skill: str = "general") -> tuple[s
     prompt_tokens = data.get("prompt_eval_count", 0)
     completion_tokens = data.get("eval_count", 0)
 
-    # Ollama ≥ 0.2 may return logprobs in one of several shapes.
-    logprobs: list[float] | None = None
-    raw = data.get("logprobs")
-    if isinstance(raw, dict):
-        vals = raw.get("token_logprobs") or raw.get("logprobs") or []
-        logprobs = [v for v in vals if isinstance(v, (int, float))] or None
-    elif isinstance(raw, list) and raw:
-        logprobs = [v for v in raw if isinstance(v, (int, float))] or None
+    logprobs = _parse_logprobs(data.get("logprobs"))
 
     asyncio.create_task(_send_keepalive())
 
@@ -340,17 +350,7 @@ async def query(prompt: str, system: str = "", messages: list = [], skill: str =
         completion_tokens – tokens in the response
         signals           – individual signal values for debugging / logging
     """
-    # Compute complexity bias from the raw query before building the full prompt
-    bias = _complexity_bias(prompt)
-
-    if messages:
-        history_text = "Previous conversation:\n"
-        for m in messages:
-            role = "User" if m["role"] == "user" else "Assistant"
-            history_text += f"{role}: {m['content']}\n"
-        full_prompt = f"{history_text}\nCurrent question: {prompt}"
-    else:
-        full_prompt = prompt
+    full_prompt = _full_prompt(prompt, messages)
 
     try:
         raw_text, logprobs, prompt_tokens, completion_tokens = await _generate(
@@ -364,26 +364,48 @@ async def query(prompt: str, system: str = "", messages: list = [], skill: str =
             exc.response.status_code,
             exc.response.text[:500],
         )
-        return {
-            "answer": "",
-            "confidence": 0.0,
-            "should_escalate": True,
-            "model": config.OLLAMA_MODEL,
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "signals": {"logprobs": None, "hedging": 0.0, "self_rating": None, "hallucination_penalty": 0.0},
-        }
+        return _failed_result()
     except (httpx.RequestError, httpx.TimeoutException) as exc:
         _log.error("Ollama request failed — escalating to cloud. Error: %s", exc)
-        return {
-            "answer": "",
-            "confidence": 0.0,
-            "should_escalate": True,
-            "model": config.OLLAMA_MODEL,
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "signals": {"logprobs": None, "hedging": 0.0, "self_rating": None, "hallucination_penalty": 0.0},
-        }
+        return _failed_result()
+
+    return _score(prompt, raw_text, logprobs, prompt_tokens, completion_tokens, skill)
+
+
+def _full_prompt(prompt: str, messages: list) -> str:
+    if not messages:
+        return prompt
+    history_text = "Previous conversation:\n"
+    for m in messages:
+        role = "User" if m["role"] == "user" else "Assistant"
+        history_text += f"{role}: {m['content']}\n"
+    return f"{history_text}\nCurrent question: {prompt}"
+
+
+def _failed_result() -> dict:
+    return {
+        "answer": "",
+        "confidence": 0.0,
+        "should_escalate": True,
+        "model": config.OLLAMA_MODEL,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "signals": {"logprobs": None, "hedging": 0.0, "self_rating": None, "hallucination_penalty": 0.0},
+    }
+
+
+def _score(
+    prompt: str,
+    raw_text: str,
+    logprobs: list[float] | None,
+    prompt_tokens: int,
+    completion_tokens: int,
+    skill: str,
+) -> dict:
+    """Combine every confidence signal for one local answer (shared by query()
+    and query_streaming() so /query and /ask/stream route identically)."""
+    # Complexity bias comes from the raw query, not the history-wrapped prompt
+    bias = _complexity_bias(prompt)
 
     answer, self_rating = _parse_self_rating(raw_text)
 
@@ -491,6 +513,104 @@ async def query(prompt: str, system: str = "", messages: list = [], skill: str =
 
 
 # ---------------------------------------------------------------------------
+# Live-streamed, confidence-scored query  (for /ask/stream)
+# ---------------------------------------------------------------------------
+
+# A complete self-rating tag followed by something that isn't another digit.
+_TAG_DONE_RE = re.compile(r"confidence\s*:\s*(10|[1-9])(?=\D)", re.IGNORECASE)
+# Any prefix of a tag ("c", "conf", "CONFIDENCE:", "confidence: 1") at the end.
+_TAG_PREFIX_RE = re.compile(
+    r"c(?:o(?:n(?:f(?:i(?:d(?:e(?:n(?:c(?:e(?:\s*(?::\s*\d{0,2})?)?)?)?)?)?)?)?)?)?)?$",
+    re.IGNORECASE,
+)
+
+
+class _TagFilter:
+    """Holds back text that might be the start of `CONFIDENCE: N` so the tag
+    the model appends for self-rating never flashes in the live answer. The
+    client still receives the cleaned final answer (a `replace` event)."""
+
+    def __init__(self) -> None:
+        self._held = ""
+
+    def feed(self, token: str) -> str:
+        buf = _TAG_DONE_RE.sub("", self._held + token)
+        m = _TAG_PREFIX_RE.search(buf)
+        cut = m.start() if m else len(buf)
+        self._held = buf[cut:]
+        return buf[:cut]
+
+    def flush(self) -> str:
+        out, self._held = _CONFIDENCE_RE.sub("", self._held), ""
+        return out
+
+
+async def query_streaming(
+    prompt: str,
+    system: str = "",
+    messages: list = [],
+    skill: str = "general",
+    *,
+    run,
+    label: str = "local",
+) -> dict:
+    """Same contract and scoring as query(), but streams the Ollama call: each
+    token and the final timings are reported to `run` (a telemetry.Run) as they
+    arrive."""
+    full_prompt = _full_prompt(prompt, messages) + _SELF_RATE_SUFFIX
+    system = system or _DEFAULT_FORMAT_SYSTEM_PROMPT
+    payload: dict = {
+        "model": config.OLLAMA_MODEL,
+        "prompt": full_prompt,
+        "system": system,
+        "stream": True,
+        "keep_alive": KEEP_ALIVE,
+        "options": _options(skill),
+        "logprobs": True,
+    }
+
+    run.begin_call(label, len(system) + len(full_prompt))
+    parts: list[str] = []
+    logprobs: list[float] = []
+    final: dict = {}
+    tags = _TagFilter()
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            async with client.stream("POST", f"{config.OLLAMA_BASE_URL}/api/generate", json=payload) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if lp := _parse_logprobs(chunk.get("logprobs")):
+                        logprobs.extend(lp)
+                    if chunk.get("done"):
+                        final = chunk
+                        break
+                    token = chunk.get("response", "")
+                    parts.append(token)
+                    run.token(tags.feed(token))
+    except httpx.HTTPStatusError as exc:
+        _log.error("Ollama returned HTTP %d — escalating to cloud.", exc.response.status_code)
+        return _failed_result()
+    except (httpx.RequestError, httpx.TimeoutException) as exc:
+        _log.error("Ollama request failed — escalating to cloud. Error: %s", exc)
+        return _failed_result()
+
+    if tail := tags.flush():
+        run.emit("token", {"text": tail})
+    run.end_call(label, final)
+
+    return _score(
+        prompt, "".join(parts), logprobs or None,
+        final.get("prompt_eval_count", 0), final.get("eval_count", 0), skill,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Streaming generation  (for /query/stream SSE endpoint)
 # ---------------------------------------------------------------------------
 
@@ -507,30 +627,12 @@ async def generate_stream(
         'data: {"token": "...", "done": false}\\n\\n'  for each token
         'data: {"token": "", "done": true, "metadata": {...}}\\n\\n'  on completion
     """
-    num_ctx     = _SKILL_NUM_CTX.get(skill, 4096)
-    num_predict = _SKILL_NUM_PREDICT.get(skill, 300)
-
-    if messages:
-        history_text = "Previous conversation:\n"
-        for m in messages:
-            role = "User" if m["role"] == "user" else "Assistant"
-            history_text += f"{role}: {m['content']}\n"
-        full_prompt = f"{history_text}\nCurrent question: {prompt}"
-    else:
-        full_prompt = prompt
-
     payload: dict = {
         "model": config.OLLAMA_MODEL,
-        "prompt": full_prompt,
+        "prompt": _full_prompt(prompt, messages),
         "stream": True,
-        "options": {
-            "num_ctx":        num_ctx,
-            "num_predict":    num_predict,
-            "temperature":    0.7,
-            "top_p":          0.9,
-            "repeat_penalty": 1.1,
-            "num_thread":     6,
-        },
+        "keep_alive": KEEP_ALIVE,
+        "options": _options(skill),
     }
     payload["system"] = system or _DEFAULT_FORMAT_SYSTEM_PROMPT
 
