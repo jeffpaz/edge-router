@@ -16,7 +16,7 @@ All notable changes to edge-router are documented here.
 - **Tests** (`tests/`, `requirements-dev.txt`) with every Ollama and cloud call faked.
 
 ### Changed
-- **Live-data questions use Grok's server-side search.** xAI retired Live Search (`search_parameters`), so `query_grok(search=True)` calls the Responses API with `web_search` and `x_search` (`GROK_SEARCH_MODEL`, default `grok-4.7`). Every live-data question now prefers Grok, not just sports; OpenAI and Claude (no live data) are the fallbacks.
+- **Live-data questions use Grok's server-side search.** xAI retired Live Search (`search_parameters`), so `query_grok(search=True)` calls the Responses API with `web_search` and `x_search` (`GROK_SEARCH_MODEL`, default `grok-4.20-0309-non-reasoning`). Every live-data question now prefers Grok, not just sports; OpenAI and Claude (no live data) are the fallbacks.
 - **Live-data failures** fall back to mini → Jetson instead of re-running normal routing (`/query`) or a bare local pass (`/query/stream`, `/ask/stream`). The three endpoints now share one implementation (`_realtime_lane()`).
 - **tripBuddy** defaults to `qwen3:4b-instruct`, so it shares the mini's loaded model.
 

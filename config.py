@@ -93,4 +93,4 @@ CLOUD_LANE_TIMEOUT_S = float(os.getenv("CLOUD_LANE_TIMEOUT_S", "60"))
 
 # Grok model for live-data questions, called through the Responses API with the
 # server-side web_search / x_search tools (xAI retired `search_parameters`).
-GROK_SEARCH_MODEL = os.getenv("GROK_SEARCH_MODEL", "grok-4.7")
+GROK_SEARCH_MODEL = os.getenv("GROK_SEARCH_MODEL", "grok-4.20-0309-non-reasoning")
