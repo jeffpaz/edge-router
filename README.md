@@ -63,6 +63,17 @@ data sensitivity and job type (`tiers.py`):
 
 Tests: `pip install -r requirements-dev.txt && python -m pytest -q` (every Ollama and cloud call is faked).
 
+### Private mode
+
+`"private": true` on `/query`, `/query/stream` or `/ask/stream` (the web chat's
+"Stay private / local" checkbox) keeps a request off every cloud provider:
+
+- **Lane:** mini → Jetson → clear error. Live-data questions are answered locally with `limitation: "live_data_unavailable"`.
+- **Second guard:** `privacy.private_scope()` marks the request, and every cloud call path calls `privacy.assert_cloud_allowed()`, which raises inside a private request.
+- **Access:** requires `auth.private_identity()` (allow-listed verified email or `PRIVATE_TOKEN`), else 401/403.
+- **Retention:** never cached, never stored in the server-side session, never logged with query or answer text.
+- **Client duty:** the client must not send private turns as `messages` history on later non-private requests. The web chat filters them out.
+
 ## Project layout
 
 ```
@@ -70,6 +81,7 @@ edge-router/
 ├── main.py                FastAPI app: /query, /query/stream, /ask/stream, /health, monitoring endpoints
 ├── router.py              Skill classifier + routing logic
 ├── tiers.py               Routing lanes (Jetson / Mac mini / cloud), lane health, mini client
+├── privacy.py             Per-request private flag + the guard every cloud call checks
 ├── local_llm.py           Ollama client with confidence scoring and SSE streaming
 ├── telemetry.py           Per-request tegrastats sampler + KV estimate for /ask/stream
 ├── auth.py                Firebase ID token verification (dormant unless AUTH_ENABLED)

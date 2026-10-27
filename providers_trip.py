@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 import httpx
 
 import config
+import privacy
 
 _log = logging.getLogger("edge_router.trip")
 
@@ -188,6 +189,7 @@ async def query_local(prompt: str, system: str, json_output: bool, json_schema: 
 # ---------------------------------------------------------------------------
 
 async def query_gemini(prompt: str, system: str, json_output: bool, json_schema: dict | None) -> TripLLMResponse:
+    privacy.assert_cloud_allowed("tripbuddy-gemini")
     from google import genai
     from google.genai import errors, types
 
@@ -244,6 +246,7 @@ async def query_gemini(prompt: str, system: str, json_output: bool, json_schema:
 # ---------------------------------------------------------------------------
 
 async def query_grok(prompt: str, system: str, json_output: bool, json_schema: dict | None) -> TripLLMResponse:
+    privacy.assert_cloud_allowed("tripbuddy-grok")
     sys_text = system
     if json_output or json_schema:
         sys_text = (sys_text + "\n\n" if sys_text else "") + "Respond with a single valid JSON object only."

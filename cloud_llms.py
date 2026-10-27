@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 
 import config
+import privacy
 
 logging.getLogger("edge_router").addHandler(logging.NullHandler())
 _log = logging.getLogger("edge_router.cloud_llms")
@@ -63,6 +64,7 @@ class CloudResponse:
 # ---------------------------------------------------------------------------
 
 async def query_claude(prompt: str, system: str = "", model: str | None = None, messages: list = []) -> CloudResponse:
+    privacy.assert_cloud_allowed("claude")
     import anthropic
 
     resolved = model or config.CLAUDE_MODEL
@@ -135,6 +137,7 @@ async def query_claude(prompt: str, system: str = "", model: str | None = None, 
 
 
 async def query_gemini(prompt: str, system: str = "", model: str | None = None, messages: list = []) -> CloudResponse:
+    privacy.assert_cloud_allowed("gemini")
     import google.generativeai as genai
     from google.api_core.exceptions import ResourceExhausted
 
@@ -197,6 +200,7 @@ async def query_grok(
     prompt: str, system: str = "", model: str | None = None, messages: list = [], search: bool = False,
 ) -> CloudResponse:
     """Chat completion, or with search=True a Responses API call with web/X search."""
+    privacy.assert_cloud_allowed("grok")
     import openai
     from openai import AsyncOpenAI
 
@@ -283,6 +287,7 @@ async def query_grok(
 
 
 async def query_openai(prompt: str, system: str = "", model: str | None = None, messages: list = []) -> CloudResponse:
+    privacy.assert_cloud_allowed("openai")
     import openai
     from openai import AsyncOpenAI
 
@@ -375,6 +380,7 @@ async def query(
     search: bool = False,
 ) -> CloudResponse:
     """search=True asks for live web search; only Grok supports it, others ignore it."""
+    privacy.assert_cloud_allowed(provider)
     fn = _PROVIDERS.get(provider)
     if fn is None:
         raise ValueError(f"Unknown provider: {provider!r}. Choose from {list(_PROVIDERS)}")

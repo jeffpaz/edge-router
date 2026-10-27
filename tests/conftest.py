@@ -73,6 +73,7 @@ class FakeOllamaHosts:
     mini_up: bool = True
     mini_chat_ok: bool = True
     jetson_up: bool = True
+    mini_answer: str = "mini answer"
     tags_calls: dict = field(default_factory=lambda: {"mini.test": 0, "jetson.test": 0})
     chat_bodies: list = field(default_factory=list)
 
@@ -90,7 +91,7 @@ class FakeOllamaHosts:
             if not (up and self.mini_chat_ok):
                 return httpx.Response(500, json={"error": "boom"})
             return httpx.Response(200, json={
-                "message": {"role": "assistant", "content": "mini answer"},
+                "message": {"role": "assistant", "content": self.mini_answer},
                 "prompt_eval_count": 11, "eval_count": 22,
             })
         return httpx.Response(404)
