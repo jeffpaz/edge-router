@@ -1485,12 +1485,13 @@ async def query_stream_endpoint(req: QueryRequest, request: Request):
 
 # ---------------------------------------------------------------------------
 # POST /ask/stream  — /query/stream's routing, with live local tokens and
-# per-request Jetson telemetry for the web "This run" panel
+# per-request telemetry (Jetson or Mac mini) for the web "This run" panel
 # ---------------------------------------------------------------------------
 # Named SSE events (`event: <kind>` + `data: <json>`), unlike /query/stream:
 #   call     {call, label, t}             an Ollama call started ("local" | "retry")
 #   token    {text}                       live answer text
-#   metrics  {t, cpu, gpu, ram, tok, tps, kv, n}   ~8/s from a tegrastats sampler
+#   metrics  {t, host, cpu, gpu, ram, tok, tps, kv, n}   ~8/s: the Jetson's tegrastats,
+#                                         or the mini's /sys/stream once a call is there
 #   phases   {call, label, load, prefill, decode, total, prompt_eval_count,
 #             eval_count, wall, t_start}  once per Ollama call, from its final chunk
 #   replace  {text, source?}              replace the answer text (retry start,
@@ -1530,6 +1531,7 @@ async def ask_stream_endpoint(req: QueryRequest, request: Request):
 
     async def private_pipeline(run: telemetry.Run) -> None:
         """PRIVATE lane only: the mini, or a live Jetson pass if the mini is down."""
+        telemetry.current_run.set(run)  # this task's own context: the mini lanes stream into run
         try:
             skill = "personal_docs" if docs else _router.skill_router.classify(req.query)
 
@@ -1553,6 +1555,7 @@ async def ask_stream_endpoint(req: QueryRequest, request: Request):
             run.events.put_nowait(None)
 
     async def pipeline(run: telemetry.Run) -> None:
+        telemetry.current_run.set(run)  # a cloud-down fallback to the mini streams too
         try:
             cached = _cache_get(req.query)
             if cached is not None:
@@ -1614,7 +1617,7 @@ async def ask_stream_endpoint(req: QueryRequest, request: Request):
     async def event_stream():
         # Leaving this block — normal end, error, or the client disconnecting —
         # cancels the pipeline (closing the Ollama stream) and kills tegrastats.
-        async with telemetry.Run(config.OLLAMA_MODEL) as run:
+        async with telemetry.Run(config.OLLAMA_MODEL, mini_sampler=tiers.mini_metrics) as run:
             task = asyncio.create_task((private_pipeline if req.private else pipeline)(run))
             try:
                 while (event := await run.events.get()) is not None:
