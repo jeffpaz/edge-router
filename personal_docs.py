@@ -8,8 +8,11 @@ checkbox on, every question consults the index first anyway; this detector is wh
 keeps document questions off the cloud when the checkbox is off.)
 
 It matches:
-  - an explicit request: "in my documents", "search my files", "in my notes"
-  - PazBrain by name: "what does PazBrain say about the homelab?"
+  - an explicit request: "in my documents", "search my files"
+  - PazBrain by name, the only way a question reaches your notes: "Ask PazBrain ...",
+    "Use PazBrain ...", "Search PazBrain for ...". Plain "notes" / "plan" / "write"
+    wording is not enough, so public questions like "did I write this correctly?" are
+    never forced private.
   - "my/our" + a document or personal-finance noun: "my 2023 W-2", "our mortgage rate",
     "my car insurance deductible", "my salary"
   - first-person money or records verbs: "what did Acme pay me", "how much did I pay in
@@ -42,10 +45,10 @@ _POSSESSIVE = re.compile(rf"\b(?:my|our)\s+(?:[\w'-]+\s+){{0,3}}?(?:{_DOC_NOUNS}
 # "in my documents", "search my files", "look through our paperwork"
 _EXPLICIT = re.compile(
     r"\b(?:in|from|search|check|look (?:in|through)|find (?:in|it in))\s+(?:my|our)\s+"
-    r"(?:personal\s+)?(?:documents?|docs|files|paperwork|records|pdfs|notes|wiki|journal|pazbrain|logseq)\b"
+    r"(?:personal\s+)?(?:documents?|docs|files|paperwork|records|pdfs)\b"
 )
-# "what does PazBrain say", "my PazBrain notes on X", "in my Logseq"
-_PAZBRAIN = re.compile(r"\bpaz ?brain\b|\b(?:my|our) (?:logseq|wiki|journal|notes?)\b")
+# "Ask PazBrain", "Use PazBrain", "search PazBrain for ..."
+_PAZBRAIN = re.compile(r"\bpaz ?brain\b")
 # "what did Acme pay me", "how much did they refund us", "who withheld from me"
 _PAID_ME = re.compile(
     r"\b(?:pay|paid|owe[sd]?|charged?|billed?|refund(?:ed)?|reimburs\w*|withh[eo]ld|"
@@ -55,7 +58,7 @@ _PAID_ME = re.compile(
 _I_DID = re.compile(
     r"\b(?:did|do|have|had)\s+(?:i|we)\s+(?:\w+\s+)?(?:pay|paid|earn(?:ed)?|make|made|"
     r"receive[d]?|get|got|owe[d]?|spend|spent|sign(?:ed)?|buy|bought|sell|sold|"
-    r"contribute[d]?|deduct(?:ed)?|claim(?:ed)?|file[d]?|write|wrote|note[d]?|decide[d]?|plan(?:ned)?)\b"
+    r"contribute[d]?|deduct(?:ed)?|claim(?:ed)?|file[d]?)\b"
 )
 _HOW_TO = re.compile(r"^\s*(?:how (?:do|can|should) (?:i|we)|how to|should (?:i|we)|what happens if)\b")
 

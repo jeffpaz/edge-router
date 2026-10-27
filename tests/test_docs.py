@@ -40,12 +40,12 @@ def assert_nothing_else_called(fx):
     "how much was my tax refund",
     "Did we sign the lease renewal?",
     "Which bank deposited my bonus?",
-    # PazBrain notes
+    # PazBrain notes: named explicitly
     "What does PazBrain say about the homelab?",
-    "search my notes for the UPS battery",
-    "What did I decide about the private tier?",
-    "what's in my journal about the move",
-    "Find the AskJetson page in my wiki",
+    "Ask PazBrain what I decided about the private tier",
+    "Use PazBrain: what's on my homelab todo list?",
+    "Search PazBrain for the UPS battery",
+    "search paz brain for the move",
 ])
 def test_personal_docs_questions_are_detected(q):
     assert personal_docs.is_personal_docs(q), q
@@ -65,6 +65,13 @@ def test_personal_docs_questions_are_detected(q):
     "Did the Chiefs win yesterday?",
     "How do I take notes in Logseq?",
     "What is a wiki?",
+    # ordinary wording that must stay public (no PazBrain)
+    "Do I write 'affect' or 'effect' here?",
+    "Did I write this sentence correctly?",
+    "What did we plan for the trip itinerary?",
+    "Did I decide wrong by picking React?",
+    "search my notes for the UPS battery",
+    "what's in my journal about the move",
 ])
 def test_other_questions_are_not(q):
     assert not personal_docs.is_personal_docs(q), q
