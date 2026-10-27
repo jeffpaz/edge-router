@@ -40,6 +40,12 @@ def assert_nothing_else_called(fx):
     "how much was my tax refund",
     "Did we sign the lease renewal?",
     "Which bank deposited my bonus?",
+    # PazBrain notes
+    "What does PazBrain say about the homelab?",
+    "search my notes for the UPS battery",
+    "What did I decide about the private tier?",
+    "what's in my journal about the move",
+    "Find the AskJetson page in my wiki",
 ])
 def test_personal_docs_questions_are_detected(q):
     assert personal_docs.is_personal_docs(q), q
@@ -57,6 +63,8 @@ def test_personal_docs_questions_are_detected(q):
     "Who won the Lakers game last night?",
     "What's a good recipe for dinner?",
     "Did the Chiefs win yesterday?",
+    "How do I take notes in Logseq?",
+    "What is a wiki?",
 ])
 def test_other_questions_are_not(q):
     assert not personal_docs.is_personal_docs(q), q

@@ -1,0 +1,11 @@
+[Unit]
+Description=Export PazBrain to the Mac mini every 15 minutes (after each Drive sync)
+
+[Timer]
+# pazbrain-sync runs at :00/:15/:30/:45; export 7 minutes later so a sync has landed
+OnCalendar=*:07/15
+Persistent=true
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
