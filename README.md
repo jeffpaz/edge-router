@@ -42,12 +42,34 @@ loaded runner, so this one shared set is what keeps follow-up queries from payin
 ~6s load again. `num_predict` still varies by skill; it's a sampling option and never
 triggers a reload.
 
+## Tiered routing
+
+Every request is classified on the Jetson (the regex skill classifier plus
+`realtime_classifier`, no LLM call), then answered by one of three lanes chosen by
+data sensitivity and job type (`tiers.py`):
+
+| Lane | Host | Serves |
+|---|---|---|
+| `local` | Jetson Ollama (`OLLAMA_MODEL`) | local-only skills and confident local answers |
+| `private` | Mac mini Ollama (`MINI_MODEL`) | batch jobs (`POST /jobs/generate`), private data (later), and the fallback when the cloud is down |
+| `cloud` | Claude / Gemini / Grok / OpenAI | every other interactive query; live-data questions go to Grok with server-side `web_search` + `x_search` (Responses API) |
+
+- **Fallback** for non-private requests, on a cloud timeout (`CLOUD_LANE_TIMEOUT_S`, whole provider chain) or every provider failing: cloud → mini → Jetson → a clear error. A live-data question answered by the mini or the Jetson comes back with `limitation: "live_data_unavailable"`. Fallback answers are never cached.
+- **Every response** (`/query`, the final frame of `/query/stream` and `/ask/stream`, `/jobs/generate`) carries `tier`, `model`, `private`, `fallback_used` and `route_reason`.
+- **Mini unset** (`MINI_OLLAMA_URL` or `MINI_MODEL` empty): the private lane is disabled, `/jobs/*` returns 503, and cloud-down fallback goes straight to the Jetson.
+- **Runner options:** every call to the mini sends `num_ctx` = `MINI_NUM_CTX` (8192, the same as tripBuddy's calls) and `keep_alive: -1`, so the shared runner is never reloaded.
+- **`GET /tiers/status`**: per-lane health. The two Ollama lanes are probed via `/api/tags` and cached 15 s; a failed mini call forces a fresh probe.
+- **`POST /jobs/generate`** `{prompt, system?, format?, num_predict?, temperature?}`: always the mini, never cloud or Jetson, so it fails closed. Requires a private identity (`auth.private_identity`): a Firebase ID token for a verified email in `PRIVATE_ALLOWED_EMAILS`, or `PRIVATE_TOKEN`. Logs metadata only.
+
+Tests: `pip install -r requirements-dev.txt && python -m pytest -q` (every Ollama and cloud call is faked).
+
 ## Project layout
 
 ```
 edge-router/
 ├── main.py                FastAPI app: /query, /query/stream, /ask/stream, /health, monitoring endpoints
 ├── router.py              Skill classifier + routing logic
+├── tiers.py               Routing lanes (Jetson / Mac mini / cloud), lane health, mini client
 ├── local_llm.py           Ollama client with confidence scoring and SSE streaming
 ├── telemetry.py           Per-request tegrastats sampler + KV estimate for /ask/stream
 ├── auth.py                Firebase ID token verification (dormant unless AUTH_ENABLED)

@@ -78,13 +78,9 @@ def classify(query: str) -> IntentResult:
     is_realtime = len(signals) > 0
     confidence = min(1.0, len(signals) * 0.25 + (0.5 if is_realtime else 0))
 
-    # Prefer Grok for sports/news (has live X data), OpenAI as fallback
-    preferred = None
-    if is_realtime:
-        has_sports = any("sports:" in s or "topic:score" in s
-                         or "topic:won" in s or "topic:game" in s
-                         for s in signals)
-        preferred = "grok" if has_sports else "openai"
+    # Grok is the only configured provider with live search (web + X), so every
+    # live-data question prefers it; the router falls back to the others.
+    preferred = "grok" if is_realtime else None
 
     return IntentResult(
         is_realtime=is_realtime,

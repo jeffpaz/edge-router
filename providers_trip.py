@@ -27,7 +27,7 @@ _log = logging.getLogger("edge_router.trip")
 # ---------------------------------------------------------------------------
 
 OLLAMA_URL       = os.getenv("TRIPBUDDY_OLLAMA_URL", "http://192.168.11.60:11434").rstrip("/")
-OLLAMA_MODEL     = os.getenv("TRIPBUDDY_OLLAMA_MODEL", "qwen2.5:7b")
+OLLAMA_MODEL     = os.getenv("TRIPBUDDY_OLLAMA_MODEL", "qwen3:4b-instruct")
 OLLAMA_NUM_CTX   = int(os.getenv("TRIPBUDDY_OLLAMA_NUM_CTX", "8192"))
 
 GEMINI_API_KEY   = os.getenv("TRIPBUDDY_GEMINI_API_KEY", "")

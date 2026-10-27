@@ -22,6 +22,9 @@ env/
 # .env.example is intentionally NOT excluded (no secrets, useful reference)
 
 # Development and deployment artifacts
+tests/
+requirements-dev.txt
+.pytest_cache/
 edge-router.service
 deploy.sh
 *.sh

@@ -188,11 +188,19 @@ async def query_gemini(prompt: str, system: str = "", model: str | None = None, 
     raise RuntimeError("unreachable")
 
 
-async def query_grok(prompt: str, system: str = "", model: str | None = None, messages: list = []) -> CloudResponse:
+# Server-side search tools for live-data questions (Responses API). They replace
+# xAI's retired Live Search (`search_parameters` on chat completions).
+_GROK_SEARCH_TOOLS = [{"type": "web_search"}, {"type": "x_search"}]
+
+
+async def query_grok(
+    prompt: str, system: str = "", model: str | None = None, messages: list = [], search: bool = False,
+) -> CloudResponse:
+    """Chat completion, or with search=True a Responses API call with web/X search."""
     import openai
     from openai import AsyncOpenAI
 
-    resolved = model or config.GROK_MODEL
+    resolved = model or (config.GROK_SEARCH_MODEL if search else config.GROK_MODEL)
     client = AsyncOpenAI(api_key=config.XAI_API_KEY, base_url="https://api.x.ai/v1")
     api_messages = []
     if system:
@@ -204,6 +212,20 @@ async def query_grok(prompt: str, system: str = "", model: str | None = None, me
         for attempt in range(_MAX_RETRIES + 1):
             try:
                 t0 = time.perf_counter()
+                if search:
+                    response = await client.responses.create(
+                        model=resolved, input=api_messages, tools=_GROK_SEARCH_TOOLS,
+                    )
+                    latency_ms = (time.perf_counter() - t0) * 1000
+                    usage = response.usage
+                    return CloudResponse(
+                        answer=response.output_text or "",
+                        provider="grok",
+                        model=resolved,
+                        latency_ms=round(latency_ms, 1),
+                        input_tokens=usage.input_tokens if usage else 0,
+                        output_tokens=usage.output_tokens if usage else 0,
+                    )
                 completion = await client.chat.completions.create(model=resolved, messages=api_messages)
                 latency_ms = (time.perf_counter() - t0) * 1000
                 usage = completion.usage
@@ -350,8 +372,12 @@ async def query(
     system: str = "",
     model: str | None = None,
     messages: list = [],
+    search: bool = False,
 ) -> CloudResponse:
+    """search=True asks for live web search; only Grok supports it, others ignore it."""
     fn = _PROVIDERS.get(provider)
     if fn is None:
         raise ValueError(f"Unknown provider: {provider!r}. Choose from {list(_PROVIDERS)}")
+    if search and provider == "grok":
+        return await fn(prompt, system, model, messages, search=True)
     return await fn(prompt, system, model, messages)
