@@ -956,10 +956,33 @@ async def _docs_lane(query: str, req_id: str = "") -> _ResolvedQuery:
         limitation="weak_evidence" if rag.get("weak_evidence") else None,
     )
     _log.info(
-        "routed",
-        extra={"req_id": req_id, "private": True, "tier": tiers.PRIVATE, "route_reason": "personal_docs",
-               "citations": len(result.citations), "weak_evidence": bool(rag.get("weak_evidence"))},
+        "docs_lane",
+        extra={"req_id": req_id, "private": True, "citations": len(result.citations),
+               "weak_evidence": bool(rag.get("weak_evidence"))},
     )
+    return result
+
+
+# Asked in private mode, these never need the user's documents: skip the index lookup
+_NO_DOCS_SKILLS = frozenset({"creative", "language_task"})
+
+
+async def _private_with_docs(
+    query: str, system: str, messages: list, skill: str, req_id: str = "", *,
+    live_data: bool, local_query=None,
+) -> _ResolvedQuery:
+    """private: true — the user's documents first, then the general private lane.
+    The documents answer is used only when the index found relevant, cited sources,
+    so private mode reaches the documents whatever the question's wording."""
+    note = ""
+    if not live_data and skill not in _NO_DOCS_SKILLS and tiers.docs_enabled():
+        docs = await _docs_lane(query, req_id)
+        if docs.source != "error" and docs.citations and docs.limitation != "weak_evidence":
+            docs.route_reason = "private -> documents"
+            return docs
+        note = "documents: nothing relevant; " if docs.source != "error" else "documents unavailable; "
+    result = await _private_lane(query, system, messages, skill, req_id, live_data=live_data, local_query=local_query)
+    result.route_reason = note + result.route_reason
     return result
 
 
@@ -1032,7 +1055,7 @@ async def query_endpoint(req: QueryRequest, request: Request) -> QueryResponse |
             if docs:
                 result = await _docs_lane(req.query, req_id)
             else:
-                result = await _private_lane(
+                result = await _private_with_docs(
                     req.query, req.system, _session_context(req.session_id, req.messages), skill, req_id,
                     live_data=classify_intent(req.query).is_realtime,
                 )
@@ -1313,7 +1336,7 @@ async def query_stream_endpoint(req: QueryRequest, request: Request):
         async def private_stream():
             with privacy.private_scope():
                 task = asyncio.ensure_future(
-                    _docs_lane(req.query, req_id) if docs else _private_lane(
+                    _docs_lane(req.query, req_id) if docs else _private_with_docs(
                         req.query, req.system, context_messages, skill, req_id, live_data=live_data,
                     )
                 )
@@ -1517,7 +1540,7 @@ async def ask_stream_endpoint(req: QueryRequest, request: Request):
                 if docs:
                     result = await _docs_lane(req.query, req_id)
                 else:
-                    result = await _private_lane(
+                    result = await _private_with_docs(
                         req.query, req.system, _session_context(req.session_id, req.messages), skill, req_id,
                         live_data=classify_intent(req.query).is_realtime, local_query=local_query,
                     )

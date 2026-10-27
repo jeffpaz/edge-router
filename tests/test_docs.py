@@ -33,6 +33,13 @@ def assert_nothing_else_called(fx):
     "search my files for the Desert Sun lease",
     "what did my last pay stub say for PTO?",
     "Show me my 1099-DIV from Vanguard",
+    "What did Acme pay me in 2023?",
+    "How much did I pay in property tax last year?",
+    "what's my car insurance deductible",
+    "What was our rent in 2021?",
+    "how much was my tax refund",
+    "Did we sign the lease renewal?",
+    "Which bank deposited my bonus?",
 ])
 def test_personal_docs_questions_are_detected(q):
     assert personal_docs.is_personal_docs(q), q
@@ -46,6 +53,10 @@ def test_personal_docs_questions_are_detected(q):
     "What's the latest news about the election today?",
     "Write a poem about my dog",
     "What is a haiku?",
+    "Reset my password please",
+    "Who won the Lakers game last night?",
+    "What's a good recipe for dinner?",
+    "Did the Chiefs win yesterday?",
 ])
 def test_other_questions_are_not(q):
     assert not personal_docs.is_personal_docs(q), q
@@ -118,3 +129,52 @@ def test_docs_question_text_is_never_logged(client, fx, logs, path):  # noqa: F8
 def test_tiers_status_reports_the_docs_lane(client, fx):
     docs = client.get("/tiers/status").json()["docs"]
     assert (docs["enabled"], docs["up"], docs["chunks"]) == (True, True, 42)
+
+
+# ── private mode: documents first, whatever the wording ──────────────────────
+
+def private(client, query, path="/query"):
+    return client.post(path, json={"query": query, "private": True}, headers=PRIVATE)
+
+
+def test_private_mode_finds_documents_without_document_wording(client, fx):
+    q = "Acme compensation summary for 2023"            # no "my", no document noun
+    assert not personal_docs.is_personal_docs(q)
+    body = private(client, q).json()
+    assert body["route_reason"] == "private -> documents" and body["citations"]
+    assert fx.ollama.chat_bodies == [] and fx.cloud.calls == []
+
+
+def test_private_mode_falls_back_to_the_mini_when_documents_have_nothing(client, fx):
+    body = private(client, "Write a python function to reverse a list").json()
+    assert len(fx.ollama.rag_calls) == 1
+    assert body["source"] == "mini" and body["citations"] == []
+    assert body["route_reason"].startswith("documents: nothing relevant")
+    assert fx.cloud.calls == []
+
+
+def test_private_mode_with_documents_down_still_answers_privately(client, fx):
+    fx.ollama.rag_up = False
+    body = private(client, "Acme compensation summary for 2023").json()
+    assert body["source"] == "mini" and body["route_reason"].startswith("documents unavailable")
+    assert fx.cloud.calls == []
+
+
+@pytest.mark.parametrize("q", [
+    "What's the latest news about the election today?",   # live data
+    "Write me a poem about the desert",                   # creative
+])
+def test_private_mode_skips_documents_when_they_cannot_help(client, fx, q):
+    private(client, q)
+    assert fx.ollama.rag_calls == []
+
+
+def test_non_private_general_questions_never_touch_documents(client, fx):
+    client.post("/query", json={"query": "Acme compensation summary for 2023"})
+    assert fx.ollama.rag_calls == []
+
+
+@pytest.mark.parametrize("path", ["/query/stream", "/ask/stream"])
+def test_private_streams_use_documents_first(client, fx, path):
+    meta = done_metadata(private(client, "Acme compensation summary for 2023", path=path))
+    assert meta["route_reason"] == "private -> documents" and meta["citations"]

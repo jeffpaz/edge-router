@@ -77,6 +77,7 @@ class FakeOllamaHosts:
     jetson_up: bool = True
     mini_answer: str = "mini answer"
     rag_up: bool = True
+    rag_finds: tuple = ("w-2", "w2", "wages", "acme", "insurance policy")  # what the fake index "has"
     rag_calls: list = field(default_factory=list)
     rag_reply: dict = field(default_factory=lambda: {
         "answer": "Box 1 wages were 85,432.10 [1].",
@@ -94,7 +95,11 @@ class FakeOllamaHosts:
                 raise httpx.ConnectError("down", request=request)
             if request.url.path == "/health":
                 return httpx.Response(200, json={"ok": True, "chunks": 42, "sources": ["docs"]})
-            self.rag_calls.append({"auth": request.headers.get("authorization"), "body": json.loads(request.content)})
+            body = json.loads(request.content)
+            self.rag_calls.append({"auth": request.headers.get("authorization"), "body": body})
+            if not any(w in body["query"].lower() for w in self.rag_finds):
+                return httpx.Response(200, json={"answer": "I couldn't find anything about that in your documents.",
+                                                 "citations": [], "weak_evidence": True, "model": "qwen3:4b-instruct"})
             return httpx.Response(200, json=self.rag_reply)
         up = self.mini_up if host == "mini.test" else self.jetson_up
         if request.url.path == "/api/tags":
