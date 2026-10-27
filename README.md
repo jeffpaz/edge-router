@@ -74,6 +74,16 @@ Tests: `pip install -r requirements-dev.txt && python -m pytest -q` (every Ollam
 - **Retention:** never cached, never stored in the server-side session, never logged with query or answer text.
 - **Client duty:** the client must not send private turns as `messages` history on later non-private requests. The web chat filters them out.
 
+### Personal documents
+
+A question about the user's own records goes to the mini's document index (PazRAG `POST /rag/query` at `MINI_RAG_URL`, bearer `MINI_RAG_TOKEN`):
+
+- **Detection (`personal_docs.py`):** an explicit "in my documents / files" request, or "my/our" in front of a document noun ("my 2023 W-2", "our mortgage rate"). General ("what is a W-2?") and how-to questions keep normal routing.
+- **Always private:** it's forced private whatever the client sent, so it needs a private identity (401/403 otherwise) and follows every private-mode rule (no cache, no session store, no text in logs).
+- **No fallback:** if the index is unset or down, the answer is a clear "unavailable", never the cloud or the Jetson.
+- **Response:** `citations` (path, file_name, page, doc_type, year, source, score) in `/query` and in the final metadata of both streams, plus `limitation: "weak_evidence"` when the index found only weak matches.
+- **Health:** `GET /tiers/status` reports the `docs` lane.
+
 ## Project layout
 
 ```

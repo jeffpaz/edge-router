@@ -7,6 +7,7 @@ All notable changes to edge-router are documented here.
 ## 2026-10-27
 
 ### Added
+- **Personal-docs lane** (`personal_docs.py`, `tiers.docs_query()`). Questions about the user's own documents are forced private and answered only by the mini's document index (`MINI_RAG_URL` + `MINI_RAG_TOKEN`), with `citations` in every response and `limitation: "weak_evidence"` when matches are weak. There is no fallback: index down or unset gives a clear error, never the cloud or the Jetson. `/tiers/status` gains a `docs` lane. Tests (`tests/test_docs.py`, cloud mocked) assert zero cloud, Jetson or general-mini calls on this path, refusal without a private identity, and no question text in logs.
 - **Private mode** (`"private": true` on `/query`, `/query/stream` and `/ask/stream`). The request goes only to the mini, then the Jetson, then a clear error, and never to a cloud provider. A live-data question is answered locally with `limitation: "live_data_unavailable"` and never reaches Grok. `force_cloud` is ignored.
 - **Two independent guards**:
   1. `_private_lane()` has no cloud client in it.

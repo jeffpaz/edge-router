@@ -19,6 +19,8 @@ os.environ.update({
     "MINI_OLLAMA_URL": "http://mini.test:11434",
     "MINI_MODEL": "qwen3:4b-instruct",
     "PRIVATE_TOKEN": "test-private-token",
+    "MINI_RAG_URL": "http://rag.test:8100",
+    "MINI_RAG_TOKEN": "test-rag-token",
     "AUTH_ENABLED": "false",
 })
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -74,11 +76,26 @@ class FakeOllamaHosts:
     mini_chat_ok: bool = True
     jetson_up: bool = True
     mini_answer: str = "mini answer"
+    rag_up: bool = True
+    rag_calls: list = field(default_factory=list)
+    rag_reply: dict = field(default_factory=lambda: {
+        "answer": "Box 1 wages were 85,432.10 [1].",
+        "citations": [{"n": 1, "source": "docs", "path": "Taxes/2023/W2 Acme.pdf", "file_name": "W2 Acme.pdf",
+                       "page": 1, "doc_type": "W2", "year": 2023, "score": 0.99}],
+        "weak_evidence": False, "model": "qwen3:4b-instruct", "filters": {"doc_type": "W2", "year": 2023},
+    })
     tags_calls: dict = field(default_factory=lambda: {"mini.test": 0, "jetson.test": 0})
     chat_bodies: list = field(default_factory=list)
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         host = request.url.host
+        if host == "rag.test":
+            if not self.rag_up:
+                raise httpx.ConnectError("down", request=request)
+            if request.url.path == "/health":
+                return httpx.Response(200, json={"ok": True, "chunks": 42, "sources": ["docs"]})
+            self.rag_calls.append({"auth": request.headers.get("authorization"), "body": json.loads(request.content)})
+            return httpx.Response(200, json=self.rag_reply)
         up = self.mini_up if host == "mini.test" else self.jetson_up
         if request.url.path == "/api/tags":
             self.tags_calls[host] += 1
