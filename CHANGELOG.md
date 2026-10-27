@@ -17,6 +17,11 @@ All notable changes to edge-router are documented here.
 
 ### Changed
 - **Live-data questions use Grok's server-side search.** xAI retired Live Search (`search_parameters`), so `query_grok(search=True)` calls the Responses API with `web_search` and `x_search` (`GROK_SEARCH_MODEL`, default `grok-4.20-0309-non-reasoning`). Every live-data question now prefers Grok, not just sports; OpenAI and Claude (no live data) are the fallbacks.
+- **Tighter live-data detector** (`realtime_classifier.py`). A flagged question now costs a Grok web search (~12k input tokens), so a single loose word no longer triggers one.
+  - A question needs a strong phrase ("latest news", "who won", "bitcoin price", "weather in …", "NBA standings"), or two signals of different kinds: a time word plus a live topic, or a team/league plus a time word or a sports/live topic.
+  - Terms match whole words only ("win" no longer fires in "window", "live" no longer in "deliver").
+  - Generic words ("price", "market", "live", "vote", "announced") no longer count, and "game"/"match" count only next to a team or league.
+  - `tests/test_realtime_classifier.py` covers 17 live and 17 everyday questions. The old detector flagged 16 of the 17 everyday ones.
 - **Live-data failures** fall back to mini → Jetson instead of re-running normal routing (`/query`) or a bare local pass (`/query/stream`, `/ask/stream`). The three endpoints now share one implementation (`_realtime_lane()`).
 - **tripBuddy** defaults to `qwen3:4b-instruct`, so it shares the mini's loaded model.
 
