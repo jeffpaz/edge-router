@@ -1,6 +1,8 @@
 # edge-router
 
-Routes LLM queries to a **local Ollama model** first. If the response confidence falls below a configurable threshold, the query is automatically escalated to a cloud provider (Claude, Gemini, Grok, or OpenAI).
+The AskJetson router on the Jetson Orin Nano (`192.168.11.50`). Queries go to a **local Ollama model** first (`llama3.2:3b`); if the response confidence falls below a configurable threshold, the query is escalated to a cloud provider (Claude, Gemini, Grok, or OpenAI). Private requests, personal documents and PazBrain questions go to the **Mac mini** instead (`192.168.11.60`, `qwen3:4b-instruct` and the PazRAG document index) and never reach a cloud provider.
+
+It runs as a Docker Compose container next to an `ollama/ollama` container and is reached publicly through a Cloudflare tunnel at `api.pazlabs.io` (the pazlabs.io web chat). See [ARCHITECTURE.md](ARCHITECTURE.md) for how the three machines fit together and [CHANGELOG.md](CHANGELOG.md) for what changed.
 
 ```
 POST /query  (or /query/stream, /ask/stream)
@@ -51,7 +53,7 @@ data sensitivity and job type (`tiers.py`):
 | Lane | Host | Serves |
 |---|---|---|
 | `local` | Jetson Ollama (`OLLAMA_MODEL`) | local-only skills and confident local answers |
-| `private` | Mac mini Ollama (`MINI_MODEL`) | batch jobs (`POST /jobs/generate`), private data (later), and the fallback when the cloud is down |
+| `private` | Mac mini Ollama (`MINI_MODEL`) and its document index (`MINI_RAG_URL`) | private mode, personal documents and PazBrain questions, batch jobs (`POST /jobs/generate`), and the fallback when the cloud is down |
 | `cloud` | Claude / Gemini / Grok / OpenAI | every other interactive query; live-data questions go to Grok with server-side `web_search` + `x_search` (Responses API) |
 
 - **Fallback** for non-private requests, on a cloud timeout (`CLOUD_LANE_TIMEOUT_S`, whole provider chain) or every provider failing: cloud → mini → Jetson → a clear error. A live-data question answered by the mini or the Jetson comes back with `limitation: "live_data_unavailable"`. Fallback answers are never cached.
@@ -90,22 +92,33 @@ A question about the user's own records goes to the mini's document index (PazRA
 - **Response:** `citations` (path, file_name, page, doc_type, year, source, score) in `/query` and in the final metadata of both streams, plus `limitation: "weak_evidence"` when the index found only weak matches.
 - **Health:** `GET /tiers/status` reports the `docs` lane.
 
+### PazBrain notes
+
+Naming PazBrain ("Ask PazBrain …", "Use PazBrain …", "Search PazBrain for …", matched by `\bpaz ?brain\b`) is how the user asks to stay private and local. Such a question is forced private and goes to the same document index, which searches the PazBrain notes and the documents together. The word itself never narrows the search to the notes. Words like "notes", "wiki" or "journal" alone keep normal routing.
+
+The notes reach the mini one way: `pazbrain/scripts/export_for_mini.py` renders the wiki (`~/pazbrain/wiki`) into one deterministic tar and pipes it over SSH with a key that, on the mini, can only run PazRAG's `scripts/pazbrain_receive.sh`. It skips unchanged exports and refuses an empty export or one with less than half the pages of the last push (`--force` overrides). The `pazbrain-mini-export.timer` (`pazbrain/systemd/`) runs it every 15 minutes once it's installed. Logs carry counts only.
+
 ## Project layout
 
 ```
 edge-router/
 ├── main.py                FastAPI app: /query, /query/stream, /ask/stream, /health, monitoring endpoints
 ├── router.py              Skill classifier + routing logic
-├── tiers.py               Routing lanes (Jetson / Mac mini / cloud), lane health, mini client
+├── tiers.py               Routing lanes (Jetson / Mac mini / cloud), lane health, mini + document-index clients
 ├── privacy.py             Per-request private flag + the guard every cloud call checks
+├── personal_docs.py       Personal-documents and PazBrain intent detection
 ├── local_llm.py           Ollama client with confidence scoring and SSE streaming
-├── telemetry.py           Per-request tegrastats sampler + KV estimate for /ask/stream
-├── auth.py                Firebase ID token verification (dormant unless AUTH_ENABLED)
+├── telemetry.py           Per-request telemetry for /ask/stream (tegrastats, mini metrics, KV estimate)
+├── auth.py                Firebase ID token verification; private_identity() allow-list
 ├── trip_routes.py         tripBuddy trip-planning endpoint (+ providers_trip.py)
-├── pazbrain/              PazBrain wiki API (/brain/api), read-only Logseq queries (/brain/query), host scripts
+├── pazbrain/              PazBrain wiki API (/brain/api), read-only Logseq queries (/brain/query),
+│                          host scripts (sync, Logseq ingest, export_for_mini.py) and systemd units
 ├── cloud_llms.py          Clients for Claude, Gemini, Grok, OpenAI
 ├── realtime_classifier.py Real-time intent detector (sports/stocks/news bypass)
 ├── config.py              API keys and settings from environment variables
+├── docker-compose.yml     edge-router + ollama containers (how it runs on the Jetson)
+├── deploy.sh              full rebuild and restart
+├── tests/                 pytest; every Ollama, mini and cloud call is faked
 └── requirements.txt
 ```
 
@@ -131,134 +144,37 @@ For the local model, history is flattened into the prompt text (`local_llm.py`: 
 
 ---
 
-## Setup on Nvidia Jetson Orin Nano
+## Running on the Jetson
 
-### 1. Flash JetPack 6.x
+The Jetson (JetPack 6, Ubuntu 22, ARM64, 8 GB shared memory) runs two containers from
+`~/edge-router/docker-compose.yml`:
 
-Use [NVIDIA SDK Manager](https://developer.nvidia.com/sdk-manager) or the Jetson Orin Nano SD card image.  
-Verify CUDA is available after boot:
+- `ollama` (`ollama/ollama`, NVIDIA runtime, models in `/mnt/models/ollama`, `OLLAMA_KEEP_ALIVE=-1`).
+- `edge-router` (built from this repo, uvicorn on `:8000`), reading `.env` and `/etc/pazbrain.env`.
 
-```bash
-nvcc --version
-python3 -c "import torch; print(torch.cuda.is_available())"
-```
-
-### 2. Install Ollama
+The Cloudflare tunnel (`cloudflared` on the host) sends `api.pazlabs.io` to `localhost:8000`.
+The `edge-router.service` systemd unit and `env.example` in this repo are from an earlier
+bare-metal setup and aren't used.
 
 ```bash
-curl -fsSL https://ollama.com/install.sh | sh
+cp .env.example .env && chmod 600 .env    # fill in keys; never commit .env
+./deploy.sh                               # first time: full no-cache rebuild
+
+# Updating to the latest main
+cd ~/edge-router && git fetch -q && git checkout -q main && git pull --ff-only \
+  && docker compose build edge-router && docker compose up -d --no-deps edge-router
+
+docker logs -f edge-router                # JSON logs; metadata only for private requests
+curl -s localhost:8000/health
+curl -s localhost:8000/tiers/status
 ```
 
-Ollama auto-detects the Jetson GPU via CUDA. Confirm:
+Tests run on any machine: `pip install -r requirements-dev.txt && python -m pytest -q`.
 
-```bash
-ollama run llama3.2:3b "Hello from Jetson"
-```
-
-For heavier workloads (8 GB RAM Orin Nano) keep to 3B–7B models.  
-Recommended: `llama3.2:3b`, `mistral:7b`, `phi3:mini`.
-
-### 3. Create a Python virtual environment
-
-```bash
-sudo apt-get install -y python3-venv python3-pip
-python3 -m venv ~/venvs/edge-router
-source ~/venvs/edge-router/bin/activate
-```
-
-### 4. Clone and install dependencies
-
-```bash
-git clone <your-repo-url> ~/edge-router
-cd ~/edge-router
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-> **Jetson note:** If `httpx` or `uvicorn` wheels fail to build, install build tools first:
-> ```bash
-> sudo apt-get install -y build-essential libssl-dev libffi-dev python3-dev
-> ```
-
-### 5. Configure environment variables
-
-Copy and edit the example:
-
-```bash
-cat > ~/.env.edge-router << 'EOF'
-# Local model
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=llama3.2:3b
-
-# Confidence threshold (0.0–1.0). Queries below this score are escalated.
-CONFIDENCE_THRESHOLD=0.65
-
-# Which cloud provider to use as fallback: claude | gemini | grok | openai
-FALLBACK_PROVIDER=claude
-
-# Cloud API keys (only the fallback provider key is required)
-ANTHROPIC_API_KEY=sk-ant-...
-GOOGLE_API_KEY=AIza...
-XAI_API_KEY=xai-...
-OPENAI_API_KEY=sk-...
-EOF
-```
-
-Load before running:
-
-```bash
-set -a && source ~/.env.edge-router && set +a
-```
-
-### 6. Start the server
-
-```bash
-cd ~/edge-router
-uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
-```
-
-`--workers 1` is recommended on Orin Nano to avoid GPU memory contention between Ollama and multiple Python processes.
-
-### 7. Test it
-
-```bash
-# Basic query — tries local model first, escalates to cloud if confidence is low
-curl -s -X POST http://localhost:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{"query": "What is 2+2?"}' | python3 -m json.tool
-
-# Force cloud (skip local model entirely)
-curl -s -X POST http://localhost:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{"query": "Write a haiku about Jetson.", "force_cloud": true}' \
-  | python3 -m json.tool
-
-# Health — shows Ollama status and which cloud APIs are configured
-curl http://localhost:8000/health
-
-# Stats — routing history, avg latency per model
-curl http://localhost:8000/stats
-```
-
-### 8. Run as a systemd service
-
-```bash
-# Create the env file from the template and fill in API keys
-sudo mkdir -p /etc/edge-router
-sudo cp ~/edge-router/env.example /etc/edge-router/env
-sudo chmod 600 /etc/edge-router/env
-sudo nano /etc/edge-router/env
-
-# Install and enable the service
-sudo cp ~/edge-router/edge-router.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable edge-router
-sudo systemctl start edge-router
-
-# Verify
-sudo systemctl status edge-router
-sudo journalctl -u edge-router -f
-```
+Host-side PazBrain jobs (outside the container, venv `/opt/pazbrain/venv`, scripts in
+`~/pazbrain/bin`): `pazbrain-sync.timer` (Drive → wiki, every 15 minutes),
+`pazbrain-query.service` (the read-only Logseq sidecar), and
+`pazbrain-mini-export.timer` (wiki → mini, not installed yet).
 
 ---
 
@@ -270,14 +186,24 @@ sudo journalctl -u edge-router -f
 | `OLLAMA_MODEL` | `llama3.2:3b` | Local model tag |
 | `CONFIDENCE_THRESHOLD` | `0.70` | Min score [0–1] to accept local response |
 | `CLAUDE_MODEL` | `claude-sonnet-4-6` | Anthropic model override |
-| `GEMINI_MODEL` | `gemini-2.0-flash` | Google model override |
+| `GEMINI_MODEL` | `gemini-2.5-flash` | Google model override |
 | `GROK_MODEL` | `grok-3-mini` | xAI model override |
 | `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI model override |
 | `PAZBRAIN_QUERY_RATE_PER_MIN` | `30` | Per-caller rate limit for `POST /brain/query` |
+| `GROK_SEARCH_MODEL` | `grok-4.20-0309-non-reasoning` | Live-data questions (Responses API with `web_search` + `x_search`) |
+| `MINI_OLLAMA_URL`, `MINI_MODEL` | unset | The mini's Ollama (`http://192.168.11.60:11434`, `qwen3:4b-instruct`). Either unset disables the private lane |
+| `MINI_NUM_CTX` | `8192` | Sent on every mini call; must match the mini daemon and tripBuddy |
+| `MINI_TIMEOUT_S`, `CLOUD_LANE_TIMEOUT_S` | `120`, `60` | Mini call timeout; whole cloud chain before falling back |
+| `MINI_RAG_URL`, `MINI_RAG_TOKEN` | unset | PazRAG on the mini (`http://192.168.11.60:8100`) and its bearer token. Either unset: documents questions get a clear "unavailable" |
+| `MINI_RAG_TIMEOUT_S` | `90` | Document-index call timeout |
+| `PRIVATE_ALLOWED_EMAILS` | unset | Verified Firebase emails allowed to use private mode, documents and `/jobs` |
+| `PRIVATE_TOKEN` | unset | Static bearer token for scripts; both unset → nobody gets the private lane |
+| `AUTH_ENABLED`, `AUTH_REQUIRED` | `false`, `false` | Verify and log Firebase tokens on public routes; `AUTH_REQUIRED` also rejects. Live: enabled, not required |
 
 The Ollama runner options (`num_ctx` 4096, `num_thread` 6) and `keep_alive: -1` are fixed
 in `local_llm.py` (`_RUNNER_OPTIONS`, `KEEP_ALIVE`), not read from the environment, so no
-call can drift from the others. `config.OLLAMA_NUM_CTX` is not used by the local client.
+call can drift from the others. `config.OLLAMA_NUM_CTX` (and the `OLLAMA_NUM_CTX=512` in
+`docker-compose.yml`) is not used by the local client: every request sets 4096.
 
 Skill → cloud LLM mapping (fixed in `router.py`'s `_SKILL_MAP`):
 
@@ -376,18 +302,19 @@ the response uses **named** SSE events (`event: <kind>` followed by `data: <json
 
 | Event | Data | When |
 |---|---|---|
-| `call` | `{call, label, t}` | An Ollama call starts; `label` is `local` or `retry` |
+| `call` | `{call, label, t}` | An Ollama call starts; `label` is `local`, `retry` or `mini` |
 | `token` | `{text}` | Live answer text |
-| `metrics` | `{t, cpu, gpu, ram, tok, tps, kv, n}` | About 8/s for the whole request |
-| `phases` | `{call, label, load, prefill, decode, total, prompt_eval_count, eval_count, wall, t_start}` | Once per Ollama call, from its final chunk (times in seconds) |
+| `metrics` | `{t, host, cpu, gpu, ram, tok, tps, kv, n}` | About 8/s for the whole request |
+| `phases` | `{call, label, load, prefill, decode, search?, total, prompt_eval_count, eval_count, wall, t_start}` | Once per Ollama call, from its final chunk (times in seconds). A documents answer reports the mini's steps (`filters`, `search`, `facts`, `answer`) when it returns; `search` is embed + retrieve + rerank |
 | `replace` | `{text, source?}` | Replace the answer text: a retry starts (`""`), the self-rating tag is stripped from the final local answer, or a cloud/cached answer arrives |
 | `done` | `{metadata, wall}` | Final; `metadata` has the same shape as `/query/stream`'s done frame |
 | `error` | `{message}` | Instead of `done` |
 
 `metrics` fields:
 - `t`: seconds since the request started.
+- `host`: whose CPU / GPU / RAM this is: `jetson` (tegrastats) or `mini` (PazRAG `GET /sys/stream`, read once a call goes to the mini).
 - `cpu`: mean of the online cores, %.
-- `gpu`: `GR3D_FREQ`, %.
+- `gpu`: `GR3D_FREQ` on the Jetson, the Apple GPU's utilisation (`ioreg`) on the mini, %.
 - `ram`: MB used.
 - `tok`: cumulative output tokens across all calls.
 - `tps`: tokens over the trailing second.
@@ -395,7 +322,9 @@ the response uses **named** SSE events (`event: <kind>` followed by `data: <json
 - `n`: tegrastats samples read.
 
 Each request runs its own `tegrastats --interval 125` subprocess, which is killed when
-the response ends, including when the client disconnects.
+the response ends, including when the client disconnects; the mini metrics stream is
+closed the same way. Private answers from the mini stream live token by token;
+documents answers arrive whole (their words don't stream yet).
 
 ### `POST /brain/query`
 
@@ -422,3 +351,15 @@ Returns Ollama reachability, version, configured cloud API keys, and the confide
 ### `GET /stats`
 
 Returns in-memory routing history: total queries, breakdown by source/skill/model, average latency per model.
+
+### `GET /tiers/status`
+
+Health of each lane: `local` (Jetson Ollama), `private` (mini Ollama), `docs` (the mini's
+document index) and `cloud` (configured providers outside a quota or billing window).
+The Ollama lanes are probed via `/api/tags` and cached 15 s.
+
+### `POST /jobs/generate`
+
+`{prompt, system?, format?, num_predict?, temperature?}` → one call on the mini, never the
+cloud or the Jetson (503 when the mini is unavailable). Needs a private identity. See
+[Tiered routing](#tiered-routing).

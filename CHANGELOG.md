@@ -7,6 +7,18 @@ All notable changes to edge-router are documented here.
 ## 2026-10-27
 
 ### Added
+- **PazBrain notes reach the mini, one way** (`pazbrain/scripts/export_for_mini.py`, `pazbrain/systemd/pazbrain-mini-export.{service,timer}`). The export reads the wiki markdown directly (`~/pazbrain/wiki`; the Logseq graph held only about a third of it), with the same skips as `logseq_ingest.py`.
+  - Each page is rendered as title, metadata line, summary and body into one deterministic tar.
+  - The tar is pushed over SSH with `~/.ssh/pazbrain_to_mini`, a key the mini restricts to PazRAG's `pazbrain_receive.sh`.
+  - Unchanged exports are skipped. Empty exports, or ones with less than half the last push, are refused (`--force` overrides). Logs carry counts only. Tests: `tests/test_pazbrain_export.py`.
+  - The timer (every 15 minutes) is in the repo but not installed yet.
+- **PazBrain questions go to the private lane** (`personal_docs.py`). Naming PazBrain ("Ask / Use / Search PazBrain …") is how the user asks to stay private. Such questions are forced private and answered by the mini's index over notes and documents together. Plain "notes", "wiki", "journal" or planning words keep normal routing.
+- **`ARCHITECTURE.md`**: the three machines, the lanes, private-request handling, runner options, telemetry and PazBrain.
+
+### Changed
+- **README:** describes the Docker Compose setup on the Jetson (the old bare-metal and systemd steps are gone; `edge-router.service` and `env.example` are marked legacy). Also: the PazBrain routing, the mini telemetry fields, `/tiers/status` and `/jobs/generate`, the private-tier settings, and the current `GEMINI_MODEL` default (`gemini-2.5-flash`).
+- **`.env.example`:** model-override comments show the current defaults. Notes that auth is enabled but not required on the Jetson.
+- **`main`** now holds the whole private-tier stack (PRs #5–#10), and the Jetson's checkout tracks `main`.
 - **"This run" telemetry from the Mac mini** (`telemetry.py`, `tiers.py`). When the mini answers an `/ask/stream` request, the panel shows the mini's own CPU %, GPU % and RAM (PazRAG `GET /sys/stream`, token-gated) instead of the Jetson's. `metrics` events carry `host: "jetson" | "mini"`.
   - Private answers from the mini now stream live token by token, with Ollama's load / prefill / decode in a `phases` event. `/query`, `/query/stream` and batch jobs stay non-streaming.
   - Documents answers report the mini's steps as `phases` when the answer arrives: filters, `search` (embed + retrieve + rerank, a `search` duration), facts and answer.
