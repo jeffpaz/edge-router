@@ -1,6 +1,6 @@
 """Personal-documents intent: questions about the user's own records (W-2s, tax returns,
-statements, policies, leases, pay, payments ...) or explicit requests to search their
-documents.
+statements, policies, leases, pay, payments ...), their PazBrain notes, or explicit
+requests to search their documents or notes.
 
 A match forces the request private and routes it to the mini's document index
 (MINI_RAG_URL) — never to a cloud provider, whatever the checkbox says. (With the
@@ -9,6 +9,10 @@ keeps document questions off the cloud when the checkbox is off.)
 
 It matches:
   - an explicit request: "in my documents", "search my files"
+  - PazBrain by name, the only way a question reaches your notes: "Ask PazBrain ...",
+    "Use PazBrain ...", "Search PazBrain for ...". Plain "notes" / "plan" / "write"
+    wording is not enough, so public questions like "did I write this correctly?" are
+    never forced private.
   - "my/our" + a document or personal-finance noun: "my 2023 W-2", "our mortgage rate",
     "my car insurance deductible", "my salary"
   - first-person money or records verbs: "what did Acme pay me", "how much did I pay in
@@ -43,6 +47,8 @@ _EXPLICIT = re.compile(
     r"\b(?:in|from|search|check|look (?:in|through)|find (?:in|it in))\s+(?:my|our)\s+"
     r"(?:personal\s+)?(?:documents?|docs|files|paperwork|records|pdfs)\b"
 )
+# "Ask PazBrain", "Use PazBrain", "search PazBrain for ..."
+_PAZBRAIN = re.compile(r"\bpaz ?brain\b")
 # "what did Acme pay me", "how much did they refund us", "who withheld from me"
 _PAID_ME = re.compile(
     r"\b(?:pay|paid|owe[sd]?|charged?|billed?|refund(?:ed)?|reimburs\w*|withh[eo]ld|"
@@ -59,7 +65,7 @@ _HOW_TO = re.compile(r"^\s*(?:how (?:do|can|should) (?:i|we)|how to|should (?:i|
 
 def is_personal_docs(query: str) -> bool:
     q = query.lower()
-    if _EXPLICIT.search(q):
+    if _EXPLICIT.search(q) or _PAZBRAIN.search(q):
         return True
     if _HOW_TO.search(q):
         return False

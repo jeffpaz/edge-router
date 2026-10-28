@@ -1,0 +1,17 @@
+[Unit]
+Description=PazBrain wiki export to the Mac mini private index (read-only, ssh, one way)
+Documentation=file:///opt/pazbrain/bin/export_for_mini.py
+After=network-online.target pazbrain-sync.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jeffpaz
+Group=jeffpaz
+Environment=HOME=/home/jeffpaz
+ExecStart=/opt/pazbrain/venv/bin/python /opt/pazbrain/bin/export_for_mini.py
+TimeoutStartSec=20min
+Nice=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
