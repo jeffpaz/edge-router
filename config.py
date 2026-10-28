@@ -91,6 +91,12 @@ MINI_TIMEOUT_S  = float(os.getenv("MINI_TIMEOUT_S", "120"))
 # answer falls back to the mini, then the Jetson.
 CLOUD_LANE_TIMEOUT_S = float(os.getenv("CLOUD_LANE_TIMEOUT_S", "60"))
 
+# Personal-docs lane: the mini's document index (PazRAG /rag/query, bearer token).
+# Either unset → personal-docs questions get a clear "unavailable" answer (never cloud).
+MINI_RAG_URL     = os.getenv("MINI_RAG_URL", "").rstrip("/")
+MINI_RAG_TOKEN   = os.getenv("MINI_RAG_TOKEN", "")
+MINI_RAG_TIMEOUT_S = float(os.getenv("MINI_RAG_TIMEOUT_S", "90"))
+
 # Grok model for live-data questions, called through the Responses API with the
 # server-side web_search / x_search tools (xAI retired `search_parameters`).
 GROK_SEARCH_MODEL = os.getenv("GROK_SEARCH_MODEL", "grok-4.20-0309-non-reasoning")

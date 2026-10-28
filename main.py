@@ -10,7 +10,7 @@ import time
 import uuid
 from collections import deque, OrderedDict
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -26,6 +26,7 @@ import auth
 import cloud_llms
 import config
 import local_llm
+import personal_docs
 import privacy
 import router as _router
 import telemetry
@@ -595,7 +596,8 @@ class QueryResponse(BaseModel):
     private: bool = False
     fallback_used: bool = False
     route_reason: str | None = None
-    limitation: str | None = None      # e.g. "live_data_unavailable"
+    limitation: str | None = None      # e.g. "live_data_unavailable", "weak_evidence"
+    citations: list[dict] = []         # personal-docs answers: path, page, doc_type, year, source
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +622,7 @@ class _ResolvedQuery:
     route_reason: str = ""
     private: bool = False
     limitation: str | None = None
+    citations: list[dict] = field(default_factory=list)
 
     def route(self) -> dict:
         """The routing fields every response carries."""
@@ -928,6 +931,61 @@ async def _private_lane(
     return result
 
 
+DOCS_UNAVAILABLE = (
+    "Your documents service on the Mac mini isn't reachable right now, so I can't answer "
+    "from your documents. Nothing was sent to the cloud."
+)
+
+
+async def _docs_lane(query: str, req_id: str = "") -> _ResolvedQuery:
+    """Personal-docs questions: the mini's document index only. No fallback — no other
+    host has the documents, and they must not leave the private tier."""
+    try:
+        rag = await tiers.docs_query(query)
+    except tiers.DocsUnavailable as exc:
+        _log.warning("docs_unavailable", extra={"req_id": req_id, "error": str(exc)})
+        return _ResolvedQuery(
+            source="error", answer=DOCS_UNAVAILABLE, model="none", confidence=None,
+            input_tokens=0, output_tokens=0, private=True,
+            route_reason=f"personal_docs; unavailable ({exc})",
+        )
+    result = _ResolvedQuery(
+        source="mini", answer=rag.get("answer", ""), model=rag.get("model") or "pazrag",
+        confidence=None, input_tokens=0, output_tokens=0, private=True,
+        route_reason="personal_docs", citations=list(rag.get("citations") or []),
+        limitation="weak_evidence" if rag.get("weak_evidence") else None,
+    )
+    _log.info(
+        "docs_lane",
+        extra={"req_id": req_id, "private": True, "citations": len(result.citations),
+               "weak_evidence": bool(rag.get("weak_evidence"))},
+    )
+    return result
+
+
+# Asked in private mode, these never need the user's documents: skip the index lookup
+_NO_DOCS_SKILLS = frozenset({"creative", "language_task"})
+
+
+async def _private_with_docs(
+    query: str, system: str, messages: list, skill: str, req_id: str = "", *,
+    live_data: bool, local_query=None,
+) -> _ResolvedQuery:
+    """private: true — the user's documents first, then the general private lane.
+    The documents answer is used only when the index found relevant, cited sources,
+    so private mode reaches the documents whatever the question's wording."""
+    note = ""
+    if not live_data and skill not in _NO_DOCS_SKILLS and tiers.docs_enabled():
+        docs = await _docs_lane(query, req_id)
+        if docs.source != "error" and docs.citations and docs.limitation != "weak_evidence":
+            docs.route_reason = "private -> documents"
+            return docs
+        note = "documents: nothing relevant; " if docs.source != "error" else "documents unavailable; "
+    result = await _private_lane(query, system, messages, skill, req_id, live_data=live_data, local_query=local_query)
+    result.route_reason = note + result.route_reason
+    return result
+
+
 def _private_query_response(result: _ResolvedQuery, req: "QueryRequest", skill: str, t_wall: float) -> QueryResponse:
     total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
     tokens = TokenBreakdown(
@@ -958,6 +1016,7 @@ def _private_query_response(result: _ResolvedQuery, req: "QueryRequest", skill: 
         tokens=tokens,
         session_id=req.session_id,
         routing_reason=result.route_reason,
+        citations=result.citations,
         **route,
     )
 
@@ -969,6 +1028,10 @@ def _private_query_response(result: _ResolvedQuery, req: "QueryRequest", skill: 
 @app.post("/query", response_model=QueryResponse)
 async def query_endpoint(req: QueryRequest, request: Request) -> QueryResponse | JSONResponse:
     req_id = uuid.uuid4().hex[:8]
+    # Personal-docs questions are always private, whatever the client sent
+    docs = personal_docs.is_personal_docs(req.query)
+    if docs:
+        req.private = True
     t_wall = time.perf_counter()
 
     _log.info(
@@ -987,12 +1050,15 @@ async def query_endpoint(req: QueryRequest, request: Request) -> QueryResponse |
         denial = await _private_denial(request, req_id)
         if denial is not None:
             return denial
-        skill = _router.skill_router.classify(req.query)
+        skill = "personal_docs" if docs else _router.skill_router.classify(req.query)
         with privacy.private_scope():
-            result = await _private_lane(
-                req.query, req.system, _session_context(req.session_id, req.messages), skill, req_id,
-                live_data=classify_intent(req.query).is_realtime,
-            )
+            if docs:
+                result = await _docs_lane(req.query, req_id)
+            else:
+                result = await _private_with_docs(
+                    req.query, req.system, _session_context(req.session_id, req.messages), skill, req_id,
+                    live_data=classify_intent(req.query).is_realtime,
+                )
         return _private_query_response(result, req, skill, t_wall)
 
     # ── Cache check — return immediately on hit, skip all inference ──────────
@@ -1233,6 +1299,8 @@ def _stream_metadata(result: "_ResolvedQuery", skill: str, t_wall: float) -> dic
     if result.escalated:
         metadata["escalated"] = True
     metadata.update(result.route())
+    if result.citations:
+        metadata["citations"] = result.citations
     return metadata
 
 
@@ -1240,6 +1308,10 @@ def _stream_metadata(result: "_ResolvedQuery", skill: str, t_wall: float) -> dic
 async def query_stream_endpoint(req: QueryRequest, request: Request):
     """Stream tokens as Server-Sent Events, escalating to cloud on low local confidence."""
     req_id = uuid.uuid4().hex[:8]
+    # Personal-docs questions are always private, whatever the client sent
+    docs = personal_docs.is_personal_docs(req.query)
+    if docs:
+        req.private = True
     t_wall = time.monotonic()
 
     _log.info(
@@ -1257,15 +1329,17 @@ async def query_stream_endpoint(req: QueryRequest, request: Request):
         denial = await _private_denial(request, req_id)
         if denial is not None:
             return denial
-        skill = _router.skill_router.classify(req.query)
+        skill = "personal_docs" if docs else _router.skill_router.classify(req.query)
         context_messages = _session_context(req.session_id, req.messages)
         live_data = classify_intent(req.query).is_realtime
 
         async def private_stream():
             with privacy.private_scope():
-                task = asyncio.ensure_future(_private_lane(
-                    req.query, req.system, context_messages, skill, req_id, live_data=live_data,
-                ))
+                task = asyncio.ensure_future(
+                    _docs_lane(req.query, req_id) if docs else _private_with_docs(
+                        req.query, req.system, context_messages, skill, req_id, live_data=live_data,
+                    )
+                )
             try:
                 async for heartbeat in _heartbeat_until_done(task):
                     yield heartbeat
@@ -1427,6 +1501,10 @@ async def query_stream_endpoint(req: QueryRequest, request: Request):
 @app.post("/ask/stream")
 async def ask_stream_endpoint(req: QueryRequest, request: Request):
     req_id = uuid.uuid4().hex[:8]
+    # Personal-docs questions are always private, whatever the client sent
+    docs = personal_docs.is_personal_docs(req.query)
+    if docs:
+        req.private = True
     t_wall = time.monotonic()
 
     _log.info(
@@ -1453,16 +1531,19 @@ async def ask_stream_endpoint(req: QueryRequest, request: Request):
     async def private_pipeline(run: telemetry.Run) -> None:
         """PRIVATE lane only: the mini, or a live Jetson pass if the mini is down."""
         try:
-            skill = _router.skill_router.classify(req.query)
+            skill = "personal_docs" if docs else _router.skill_router.classify(req.query)
 
             async def local_query(prompt: str, system: str, messages: list, skill: str) -> dict:
                 return await local_llm.query_streaming(prompt, system, messages, skill, run=run, label="local")
 
             with privacy.private_scope():
-                result = await _private_lane(
-                    req.query, req.system, _session_context(req.session_id, req.messages), skill, req_id,
-                    live_data=classify_intent(req.query).is_realtime, local_query=local_query,
-                )
+                if docs:
+                    result = await _docs_lane(req.query, req_id)
+                else:
+                    result = await _private_with_docs(
+                        req.query, req.system, _session_context(req.session_id, req.messages), skill, req_id,
+                        live_data=classify_intent(req.query).is_realtime, local_query=local_query,
+                    )
             run.replace(result.answer, source=result.source)
             finish(run, result.answer, _stream_metadata(result, skill, t_wall))
         except Exception as exc:

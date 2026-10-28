@@ -40,8 +40,16 @@ class MiniUnavailable(Exception):
     """The PRIVATE lane is disabled, unhealthy, or the call failed."""
 
 
+class DocsUnavailable(Exception):
+    """The personal-docs service (MINI_RAG_URL) is unset, down, or refused the call."""
+
+
 def mini_enabled() -> bool:
     return bool(config.MINI_OLLAMA_URL and config.MINI_MODEL)
+
+
+def docs_enabled() -> bool:
+    return bool(config.MINI_RAG_URL and config.MINI_RAG_TOKEN)
 
 
 @dataclass
@@ -111,6 +119,48 @@ async def lane_health(lane: str) -> dict:
     return result
 
 
+async def docs_health() -> dict:
+    """The mini's document index service (GET /health), cached HEALTH_TTL seconds."""
+    if not docs_enabled():
+        return {"up": False, "error": "disabled (MINI_RAG_URL / MINI_RAG_TOKEN unset)"}
+    cached = _health.get("docs")
+    if cached and time.monotonic() < cached[0]:
+        return cached[1]
+    t0 = time.perf_counter()
+    try:
+        async with _client(3.0) as client:
+            r = await client.get(f"{config.MINI_RAG_URL}/health")
+            r.raise_for_status()
+        body = r.json()
+        result = {"up": True, "chunks": body.get("chunks"), "sources": body.get("sources", [])}
+    except Exception as exc:
+        result = {"up": False, "error": type(exc).__name__}
+    result["latency_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+    _health["docs"] = (time.monotonic() + HEALTH_TTL, result)
+    return result
+
+
+async def docs_query(query: str) -> dict:
+    """POST /rag/query on the mini. Returns {answer, citations, weak_evidence, model, ...}.
+    Raises DocsUnavailable; the caller never falls back anywhere (no other host has the
+    documents, and they must not leave the private tier). Never logs the query."""
+    if not docs_enabled():
+        raise DocsUnavailable("personal-docs lane disabled")
+    try:
+        async with _client(config.MINI_RAG_TIMEOUT_S) as client:
+            r = await client.post(
+                f"{config.MINI_RAG_URL}/rag/query",
+                json={"query": query},
+                headers={"Authorization": f"Bearer {config.MINI_RAG_TOKEN}"},
+            )
+            r.raise_for_status()
+            return r.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        _health.pop("docs", None)
+        _log.warning("docs_call_failed", extra={"error_type": type(exc).__name__})
+        raise DocsUnavailable(type(exc).__name__) from exc
+
+
 def cloud_health() -> dict:
     """Configured cloud providers minus those in a quota/billing degraded window.
     No network probe here: GET /providers/status does that, cached 5 minutes."""
@@ -126,10 +176,11 @@ def cloud_health() -> dict:
 
 
 async def status() -> dict:
-    local, mini = await asyncio.gather(lane_health(LOCAL), lane_health(PRIVATE))
+    local, mini, docs = await asyncio.gather(lane_health(LOCAL), lane_health(PRIVATE), docs_health())
     return {
         LOCAL:   {"enabled": True, "host": "jetson", **local},
         PRIVATE: {"enabled": mini_enabled(), "host": "mac-mini", **mini},
+        "docs":  {"enabled": docs_enabled(), "host": "mac-mini", **docs},
         CLOUD:   {"enabled": True, **cloud_health()},
         "health_ttl_s": HEALTH_TTL,
     }
