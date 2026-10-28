@@ -7,6 +7,10 @@ All notable changes to edge-router are documented here.
 ## 2026-10-27
 
 ### Added
+- **"This run" telemetry from the Mac mini** (`telemetry.py`, `tiers.py`). When the mini answers an `/ask/stream` request, the panel shows the mini's own CPU %, GPU % and RAM (PazRAG `GET /sys/stream`, token-gated) instead of the Jetson's. `metrics` events carry `host: "jetson" | "mini"`.
+  - Private answers from the mini now stream live token by token, with Ollama's load / prefill / decode in a `phases` event. `/query`, `/query/stream` and batch jobs stay non-streaming.
+  - Documents answers report the mini's steps as `phases` when the answer arrives: filters, `search` (embed + retrieve + rerank, a `search` duration), facts and answer.
+  - The KV estimate covers `qwen3:4b-instruct`. Closing the run closes the mini metrics stream, the same way it kills tegrastats. Tests: `tests/test_telemetry.py`.
 - **Personal-docs lane** (`personal_docs.py`, `tiers.docs_query()`). Questions about the user's own documents are forced private and answered only by the mini's document index (`MINI_RAG_URL` + `MINI_RAG_TOKEN`), with `citations` in every response and `limitation: "weak_evidence"` when matches are weak. There is no fallback: index down or unset gives a clear error, never the cloud or the Jetson. `/tiers/status` gains a `docs` lane.
   - Private mode consults the index first for any question, whatever the wording (except live-data, creative and language-task questions), using the documents answer only when it has relevant, cited sources.
   - With the checkbox off, detection also covers first-person money and records wording ("what did Acme pay me", "my deductible").

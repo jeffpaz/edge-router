@@ -12,6 +12,7 @@ Non-private fallback order on cloud timeout/5xx: cloud → mini → Jetson.
 """
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import asdict, dataclass
@@ -20,6 +21,7 @@ import httpx
 
 import config
 import router as _router
+import telemetry
 
 _log = logging.getLogger("edge_router.tiers")
 
@@ -146,6 +148,10 @@ async def docs_query(query: str) -> dict:
     documents, and they must not leave the private tier). Never logs the query."""
     if not docs_enabled():
         raise DocsUnavailable("personal-docs lane disabled")
+    run = telemetry.current_run.get()
+    if run is not None:
+        run.use_host("mini")
+        t_sent = run.elapsed()
     try:
         async with _client(config.MINI_RAG_TIMEOUT_S) as client:
             r = await client.post(
@@ -154,11 +160,30 @@ async def docs_query(query: str) -> dict:
                 headers={"Authorization": f"Bearer {config.MINI_RAG_TOKEN}"},
             )
             r.raise_for_status()
-            return r.json()
+            rag = r.json()
     except (httpx.HTTPError, ValueError) as exc:
         _health.pop("docs", None)
         _log.warning("docs_call_failed", extra={"error_type": type(exc).__name__})
         raise DocsUnavailable(type(exc).__name__) from exc
+    if run is not None and isinstance(rag.get("calls"), list):
+        run.remote_calls(rag["calls"], offset=t_sent, model=rag.get("model") or config.MINI_MODEL)
+    return rag
+
+
+async def mini_metrics():
+    """The mini's CPU / GPU / RAM samples (PazRAG GET /sys/stream, ~8/s) for a
+    telemetry.Run. Ends when the caller stops iterating, which closes the stream."""
+    if not docs_enabled():
+        return
+    async with _client(10.0) as client:
+        async with client.stream(
+            "GET", f"{config.MINI_RAG_URL}/sys/stream",
+            headers={"Authorization": f"Bearer {config.MINI_RAG_TOKEN}"},
+        ) as r:
+            r.raise_for_status()
+            async for line in r.aiter_lines():
+                if line:
+                    yield json.loads(line)
 
 
 def cloud_health() -> dict:
@@ -208,8 +233,9 @@ async def mini_generate(
     temperature: float = 0.7,
     format: dict | str | None = None,
 ) -> MiniResult:
-    """One non-streaming chat call to the mini. Raises MiniUnavailable instead of
-    falling back anywhere; the caller decides what comes next.
+    """One chat call to the mini. Raises MiniUnavailable instead of falling back
+    anywhere; the caller decides what comes next. Inside an /ask/stream run (and
+    without a `format`) it streams, so the answer and its timings reach the panel live.
 
     Never logs prompt or answer text: this lane carries private requests.
     """
@@ -232,12 +258,16 @@ async def mini_generate(
     if format is not None:
         body["format"] = format
 
+    run = telemetry.current_run.get() if format is None else None
     t0 = time.perf_counter()
     try:
-        async with _client(config.MINI_TIMEOUT_S) as client:
-            r = await client.post(f"{config.MINI_OLLAMA_URL}/api/chat", json=body)
-            r.raise_for_status()
-            data = r.json()
+        if run is None:
+            async with _client(config.MINI_TIMEOUT_S) as client:
+                r = await client.post(f"{config.MINI_OLLAMA_URL}/api/chat", json=body)
+                r.raise_for_status()
+                data = r.json()
+        else:
+            data = await _mini_stream(body, run, prompt_chars=sum(len(m["content"] or "") for m in chat))
     except (httpx.HTTPError, ValueError) as exc:
         _health.pop(PRIVATE, None)  # re-probe on the next call
         _log.warning("mini_call_failed", extra={"error_type": type(exc).__name__})
@@ -250,3 +280,26 @@ async def mini_generate(
         output_tokens=data.get("eval_count", 0),
         latency_ms=round((time.perf_counter() - t0) * 1000, 1),
     )
+
+
+async def _mini_stream(body: dict, run, *, prompt_chars: int) -> dict:
+    """mini_generate's call with stream=True: tokens and Ollama's timings go to `run`.
+    Returns the same shape as the non-streaming reply."""
+    run.begin_call("mini", prompt_chars, host="mini", model=config.MINI_MODEL)
+    parts: list[str] = []
+    final: dict = {}
+    async with _client(config.MINI_TIMEOUT_S) as client:
+        async with client.stream("POST", f"{config.MINI_OLLAMA_URL}/api/chat", json={**body, "stream": True}) as r:
+            r.raise_for_status()
+            async for line in r.aiter_lines():
+                if not line:
+                    continue
+                chunk = json.loads(line)
+                if chunk.get("done"):
+                    final = chunk
+                    break
+                text = (chunk.get("message") or {}).get("content", "")
+                parts.append(text)
+                run.token(text)
+    run.end_call("mini", final)
+    return {**final, "message": {"role": "assistant", "content": "".join(parts)}}

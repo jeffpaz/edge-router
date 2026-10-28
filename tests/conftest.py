@@ -84,7 +84,15 @@ class FakeOllamaHosts:
         "citations": [{"n": 1, "source": "docs", "path": "Taxes/2023/W2 Acme.pdf", "file_name": "W2 Acme.pdf",
                        "page": 1, "doc_type": "W2", "year": 2023, "score": 0.99}],
         "weak_evidence": False, "model": "qwen3:4b-instruct", "filters": {"doc_type": "W2", "year": 2023},
+        "calls": [
+            {"label": "filters", "t_start": 0.0, "wall": 0.4, "load": 0.0, "prefill": 0.2, "decode": 0.2,
+             "prompt_eval_count": 300, "eval_count": 12},
+            {"label": "search", "t_start": 0.4, "wall": 1.5, "search": 1.5},
+            {"label": "answer", "t_start": 1.9, "wall": 2.1, "load": 0.1, "prefill": 0.8, "decode": 1.2,
+             "prompt_eval_count": 1800, "eval_count": 30},
+        ],
     })
+    sys_streams: list = field(default_factory=list)   # auth headers of /sys/stream opens
     tags_calls: dict = field(default_factory=lambda: {"mini.test": 0, "jetson.test": 0})
     chat_bodies: list = field(default_factory=list)
 
@@ -95,6 +103,10 @@ class FakeOllamaHosts:
                 raise httpx.ConnectError("down", request=request)
             if request.url.path == "/health":
                 return httpx.Response(200, json={"ok": True, "chunks": 42, "sources": ["docs"]})
+            if request.url.path == "/sys/stream":
+                self.sys_streams.append(request.headers.get("authorization"))
+                sample = json.dumps({"cpu": 42.0, "gpu": 77, "ram": 6100, "ram_total": 8192})
+                return httpx.Response(200, content=(sample + "\n") * 3)
             body = json.loads(request.content)
             self.rag_calls.append({"auth": request.headers.get("authorization"), "body": body})
             if not any(w in body["query"].lower() for w in self.rag_finds):
@@ -112,6 +124,14 @@ class FakeOllamaHosts:
             self.chat_bodies.append(json.loads(request.content))
             if not (up and self.mini_chat_ok):
                 return httpx.Response(500, json={"error": "boom"})
+            if self.chat_bodies[-1].get("stream"):
+                words = self.mini_answer.split(" ")
+                lines = [{"message": {"content": w if i == 0 else " " + w}, "done": False}
+                         for i, w in enumerate(words)]
+                lines.append({"message": {"content": ""}, "done": True, "prompt_eval_count": 11,
+                              "eval_count": len(words), "load_duration": 5e8, "prompt_eval_duration": 2e8,
+                              "eval_duration": 9e8, "total_duration": 1.7e9})
+                return httpx.Response(200, content="".join(json.dumps(x) + "\n" for x in lines))
             return httpx.Response(200, json={
                 "message": {"role": "assistant", "content": self.mini_answer},
                 "prompt_eval_count": 11, "eval_count": 22,
