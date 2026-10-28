@@ -18,6 +18,7 @@ key set, cached and refreshed per its Cache-Control max-age.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import time
 from typing import Any
@@ -159,3 +160,30 @@ def bearer_token(authorization_header: str) -> str:
     """Pull the raw token out of an `Authorization: Bearer <token>` header value."""
     prefix = authorization_header[:7].lower()
     return authorization_header[7:].strip() if prefix == "bearer " else ""
+
+
+class Forbidden(AuthError):
+    """Valid token, but the account isn't allowed to use the private lane."""
+
+
+async def private_identity(authorization_header: str) -> str:
+    """Return who may use the PRIVATE lane: 'token:private' or 'firebase:<email>'.
+
+    Anyone can create a pazlabs.io account, so a valid ID token alone isn't
+    enough: the email must be verified and in PRIVATE_ALLOWED_EMAILS. Fails
+    closed when neither PRIVATE_TOKEN nor the allow-list is set. Raises
+    AuthError (→ 401) or Forbidden (→ 403).
+    """
+    token = bearer_token(authorization_header)
+    if not token:
+        raise AuthError("Missing bearer token.")
+    if config.PRIVATE_TOKEN and hmac.compare_digest(token.encode(), config.PRIVATE_TOKEN.encode()):
+        return "token:private"
+    if token.count(".") != 2:
+        raise AuthError("Invalid token.")
+    claims = await verify_token(token)
+    email = str(claims.get("email") or "").lower()
+    if email and claims.get("email_verified") is True and email in config.PRIVATE_ALLOWED_EMAILS:
+        return f"firebase:{email}"
+    _log.warning("private_forbidden_email", extra={"email": email})
+    raise Forbidden("This account is not allowed to use private mode.")

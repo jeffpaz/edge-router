@@ -4,6 +4,27 @@ All notable changes to edge-router are documented here.
 
 ---
 
+## 2026-10-26
+
+### Added
+- **Tiered routing** (`tiers.py`): three lanes, `local` (Jetson), `private` (Mac mini) and `cloud`, chosen by data sensitivity and job type. The private lane is configured with `MINI_OLLAMA_URL` / `MINI_MODEL` and is disabled (fail closed) when either is unset.
+- **Cloud fallback**: when the cloud lane times out (`CLOUD_LANE_TIMEOUT_S`, default 60 s for the whole provider chain) or every provider fails, the answer comes from the mini, then the Jetson, then a clear error. This applies to escalations, `force_cloud` and live-data questions. Fallback answers are never cached.
+- **Route fields on every response**: `tier`, `model`, `private`, `fallback_used`, `route_reason`, plus `limitation` (`live_data_unavailable` when a live-data question was answered without the cloud).
+- **`GET /tiers/status`**: per-lane health, Ollama `/api/tags` probes cached 15 s.
+- **`POST /jobs/generate`**: batch work that always runs on the mini, needs a private identity, and logs metadata only.
+- **`auth.private_identity()`**: a Firebase ID token for a verified email in `PRIVATE_ALLOWED_EMAILS`, or the static `PRIVATE_TOKEN`. Fails closed when both are unset.
+- **Tests** (`tests/`, `requirements-dev.txt`) with every Ollama and cloud call faked.
+
+### Changed
+- **Live-data questions use Grok's server-side search.** xAI retired Live Search (`search_parameters`), so `query_grok(search=True)` calls the Responses API with `web_search` and `x_search` (`GROK_SEARCH_MODEL`, default `grok-4.20-0309-non-reasoning`). Every live-data question now prefers Grok, not just sports; OpenAI and Claude (no live data) are the fallbacks.
+- **Tighter live-data detector** (`realtime_classifier.py`). A flagged question now costs a Grok web search (~12k input tokens), so a single loose word no longer triggers one.
+  - A question needs a strong phrase ("latest news", "who won", "bitcoin price", "weather in …", "NBA standings"), or two signals of different kinds: a time word plus a live topic, or a team/league plus a time word or a sports/live topic.
+  - Terms match whole words only ("win" no longer fires in "window", "live" no longer in "deliver").
+  - Generic words ("price", "market", "live", "vote", "announced") no longer count, and "game"/"match" count only next to a team or league.
+  - `tests/test_realtime_classifier.py` covers 17 live and 17 everyday questions. The old detector flagged 16 of the 17 everyday ones.
+- **Live-data failures** fall back to mini → Jetson instead of re-running normal routing (`/query`) or a bare local pass (`/query/stream`, `/ask/stream`). The three endpoints now share one implementation (`_realtime_lane()`).
+- **tripBuddy** defaults to `qwen3:4b-instruct`, so it shares the mini's loaded model.
+
 ## 2026-10-25
 
 ### Added

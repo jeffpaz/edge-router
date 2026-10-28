@@ -28,6 +28,7 @@ import config
 import local_llm
 import router as _router
 import telemetry
+import tiers
 from realtime_classifier import classify as classify_intent
 
 
@@ -543,6 +544,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
             "tokens": {"input": 0, "output": 0, "total": 0},
             "session_id": None,
             "error": str(exc),
+            **_ERROR_ROUTE,
         },
     )
 
@@ -581,6 +583,13 @@ class QueryResponse(BaseModel):
     realtime_intent: bool = False
     realtime_signals: list[str] = []
     routing_reason: str | None = None
+    # Tiered routing (tiers.py): which lane actually answered, and why
+    tier: str | None = None            # "local" (Jetson) | "private" (Mac mini) | "cloud"
+    model: str | None = None
+    private: bool = False
+    fallback_used: bool = False
+    route_reason: str | None = None
+    limitation: str | None = None      # e.g. "live_data_unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -591,21 +600,42 @@ class QueryResponse(BaseModel):
 
 @dataclass
 class _ResolvedQuery:
-    source: str             # "local" | cloud provider name | "error"
+    source: str             # "local" | "mini" | cloud provider name | "error"
     answer: str
     model: str
-    confidence: float
+    confidence: float | None  # local model confidence; None when no local pass ran
     input_tokens: int
     output_tokens: int
     local_only: bool = False
     retry: bool = False
     escalated: bool = False
     cloud_latency_ms: float | None = None
+    fallback_used: bool = False
+    route_reason: str = ""
+    private: bool = False
+    limitation: str | None = None
+
+    def route(self) -> dict:
+        """The routing fields every response carries."""
+        fields = tiers.RouteInfo(
+            tier=tiers.tier_of(self.source), model=self.model, private=self.private,
+            fallback_used=self.fallback_used, route_reason=self.route_reason,
+        ).fields()
+        if self.limitation:
+            fields["limitation"] = self.limitation
+        return fields
+
+
+def _cached_route(cached: dict) -> dict:
+    return tiers.RouteInfo(tier=tiers.LOCAL, model=cached["model_used"], route_reason="cache_hit").fields()
+
+
+_ERROR_ROUTE = tiers.RouteInfo(tier=None, model="none", route_reason="error").fields()
 
 
 async def _resolve_query(
     query: str, system: str, messages: list, skill: str, req_id: str = "",
-    local_query=local_llm.query,
+    local_query=None,
 ) -> _ResolvedQuery:
     """Run the local model, then decide whether to return it or escalate to cloud.
 
@@ -617,6 +647,7 @@ async def _resolve_query(
     `local_query` is local_llm.query by default; /ask/stream passes a wrapper
     around local_llm.query_streaming so each local pass streams live.
     """
+    local_query = local_query or local_llm.query
     local = await local_query(query, system, messages, skill=skill)
     _log.info(
         "local_inference",
@@ -639,7 +670,7 @@ async def _resolve_query(
             source="local", answer=local["answer"], model=local["model"],
             confidence=local["confidence"],
             input_tokens=local["prompt_tokens"], output_tokens=local["completion_tokens"],
-            local_only=True,
+            local_only=True, route_reason=f"local_only_skill:{skill}",
         )
 
     if not local["should_escalate"]:
@@ -647,6 +678,7 @@ async def _resolve_query(
             source="local", answer=local["answer"], model=local["model"],
             confidence=local["confidence"],
             input_tokens=local["prompt_tokens"], output_tokens=local["completion_tokens"],
+            route_reason="local_confident",
         )
 
     if config.RETRY_ENABLED and skill in ("general", "coding"):
@@ -666,7 +698,7 @@ async def _resolve_query(
                     source="local", answer=retry_local["answer"], model=retry_local["model"],
                     confidence=retry_local["confidence"],
                     input_tokens=retry_local["prompt_tokens"], output_tokens=retry_local["completion_tokens"],
-                    retry=True,
+                    retry=True, route_reason="local_retry_confident",
                 )
             _log.info(
                 "local_retry_failed — escalating to cloud",
@@ -682,16 +714,132 @@ async def _resolve_query(
             "threshold":  config.SKILL_THRESHOLDS.get(skill, config.CONFIDENCE_THRESHOLD),
         },
     )
-    cloud = await _router.skill_router.dispatch(
-        query, skill, system, messages,
-        local_answer=local["answer"],
-        confidence=local["confidence"],
+    return await _cloud_lane(
+        query, system, messages, skill, req_id,
+        reason=f"escalated:{skill} local_confidence={local['confidence']:.2f}",
+        local=local, local_query=local_query,
     )
+
+
+async def _cloud_lane(
+    query: str, system: str, messages: list, skill: str, req_id: str = "", *,
+    reason: str, local: dict | None = None, local_query=None,
+) -> _ResolvedQuery:
+    """CLOUD lane: SkillRouter.dispatch() with its own provider fallback chain, bounded
+    by CLOUD_LANE_TIMEOUT_S. On timeout or every provider failing: mini, then Jetson.
+
+    `local` is the Jetson's answer when a local pass already ran (escalation), so the
+    Jetson fallback can reuse it instead of running the model again.
+    """
+    confidence = local["confidence"] if local else None
+    try:
+        cloud = await asyncio.wait_for(
+            _router.skill_router.dispatch(query, skill, system, messages, confidence=confidence),
+            timeout=config.CLOUD_LANE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        failure = f"cloud timed out after {config.CLOUD_LANE_TIMEOUT_S:g}s"
+    else:
+        if cloud.provider != "error":
+            return _ResolvedQuery(
+                source=cloud.provider, answer=cloud.answer, model=cloud.model,
+                confidence=confidence,
+                input_tokens=cloud.input_tokens, output_tokens=cloud.output_tokens,
+                escalated=local is not None, cloud_latency_ms=cloud.latency_ms,
+                route_reason=reason,
+            )
+        failure = "all cloud providers failed"
+    return await _fallback_after_cloud(
+        query, system, messages, skill, req_id,
+        reason=f"{reason}; {failure}", local=local, local_query=local_query,
+    )
+
+
+async def _realtime_lane(
+    query: str, system: str, messages: list, skill: str, signals: list[str],
+    preferred: str | None, req_id: str = "", *, local_query=None,
+) -> _ResolvedQuery:
+    """Live-data questions: Grok with web/X search first, then the other configured
+    providers, bounded by CLOUD_LANE_TIMEOUT_S. If the cloud is unreachable the mini,
+    then the Jetson answer, flagged limitation="live_data_unavailable"."""
+    reason = f"realtime_intent signals={signals}"
+    available = tiers.cloud_health()["providers"]
+    order = [preferred] + [p for p in ("grok", "openai", "claude") if p != preferred]
+    candidates = [p for p in order if p in available]
+
+    async def attempt() -> cloud_llms.CloudResponse | None:
+        for provider in candidates:
+            try:
+                return await cloud_llms.query(provider, query, system, messages=messages, search=True)
+            except cloud_llms.ProviderError as exc:
+                if _router._is_billing_error(exc):
+                    _router._mark_degraded(provider)
+                _log.warning(
+                    "realtime_provider_failed provider=%s", provider,
+                    extra={"req_id": req_id, "provider": provider, "error_type": exc.error_type},
+                )
+        return None
+
+    try:
+        cloud = await asyncio.wait_for(attempt(), timeout=config.CLOUD_LANE_TIMEOUT_S)
+        failure = "all cloud providers failed" if candidates else "no cloud provider available"
+    except asyncio.TimeoutError:
+        cloud, failure = None, f"cloud timed out after {config.CLOUD_LANE_TIMEOUT_S:g}s"
+    if cloud is not None:
+        _log.info(
+            "realtime_intent_routed provider=%s", cloud.provider,
+            extra={"req_id": req_id, "provider": cloud.provider, "skill": skill, "signals": signals},
+        )
+        return _ResolvedQuery(
+            source=cloud.provider, answer=cloud.answer, model=cloud.model, confidence=None,
+            input_tokens=cloud.input_tokens, output_tokens=cloud.output_tokens,
+            cloud_latency_ms=cloud.latency_ms, route_reason=reason,
+        )
+    result = await _fallback_after_cloud(
+        query, system, messages, skill, req_id, reason=f"{reason}; {failure}", local_query=local_query,
+    )
+    if result.source != "error":
+        result.limitation = "live_data_unavailable"
+    return result
+
+
+async def _fallback_after_cloud(
+    query: str, system: str, messages: list, skill: str, req_id: str = "", *,
+    reason: str, local: dict | None = None, local_query=None,
+) -> _ResolvedQuery:
+    """The cloud is unreachable for a non-private request: mini, then Jetson, then a
+    clear error. Never logs query or answer text."""
+    try:
+        mini = await tiers.mini_generate(
+            query, system, messages, num_predict=local_llm._SKILL_NUM_PREDICT.get(skill, 600),
+        )
+    except tiers.MiniUnavailable as exc:
+        _log.warning("cloud_fallback_mini_unavailable", extra={"req_id": req_id, "error": str(exc)})
+        reason = f"{reason}; mini unavailable ({exc})"
+    else:
+        _log.info("cloud_fallback", extra={"req_id": req_id, "tier": tiers.PRIVATE, "model": mini.model})
+        return _ResolvedQuery(
+            source="mini", answer=mini.answer, model=mini.model,
+            confidence=local["confidence"] if local else None,
+            input_tokens=mini.input_tokens, output_tokens=mini.output_tokens,
+            fallback_used=True, route_reason=f"{reason} -> mini",
+        )
+
+    if local is None:
+        local = await (local_query or local_llm.query)(query, system, messages, skill=skill)
+    if local["answer"]:
+        _log.info("cloud_fallback", extra={"req_id": req_id, "tier": tiers.LOCAL, "model": local["model"]})
+        return _ResolvedQuery(
+            source="local", answer=local["answer"], model=local["model"],
+            confidence=local["confidence"],
+            input_tokens=local["prompt_tokens"], output_tokens=local["completion_tokens"],
+            fallback_used=True, route_reason=f"{reason} -> jetson",
+        )
     return _ResolvedQuery(
-        source=cloud.provider, answer=cloud.answer, model=cloud.model,
-        confidence=local["confidence"],
-        input_tokens=cloud.input_tokens, output_tokens=cloud.output_tokens,
-        escalated=True, cloud_latency_ms=cloud.latency_ms,
+        source="error",
+        answer="Sorry, I couldn't reach the cloud, the Mac mini, or the local model. Please try again.",
+        model="none", confidence=None, input_tokens=0, output_tokens=0,
+        fallback_used=True, route_reason=f"{reason}; jetson unavailable",
     )
 
 
@@ -741,146 +889,28 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
                 tokens=tokens,
                 session_id=req.session_id,
                 cache_hit=True,
+                **_cached_route(cached),
             )
 
     skill = _router.skill_router.classify(req.query)
     context_messages = _session_context(req.session_id, req.messages)
 
-    try:
-        # ── Realtime intent bypass — skips local LLM for sports/news/price ──────
-        _rt = classify_intent(req.query)
-        _routing_reason: str | None = None
-        if _rt.is_realtime and not req.force_cloud:
-            preferred = _rt.preferred_provider
-            available = [p for p in ["grok", "openai", "claude"] if not _router._is_degraded(p)]
-            selected = preferred if preferred in available else (available[0] if available else None)
-            if selected:
-                _routing_reason = f"realtime_intent signals={_rt.signals}"
-                try:
-                    rt_cloud = await cloud_llms.query(selected, req.query, req.system, messages=context_messages)
-                    total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
-                    tokens   = TokenBreakdown(
-                        input=rt_cloud.input_tokens,
-                        output=rt_cloud.output_tokens,
-                        total=rt_cloud.input_tokens + rt_cloud.output_tokens,
-                    )
-                    _stats.record({
-                        "ts":               datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                        "session_id":       req.session_id,
-                        "source":           rt_cloud.provider,
-                        "model_used":       rt_cloud.model,
-                        "skill":            skill,
-                        "latency_ms":       total_ms,
-                        "confidence_score": None,
-                        "tokens":           tokens.model_dump(),
-                        "status":           "success",
-                        "realtime_intent":  True,
-                        "realtime_signals": _rt.signals,
-                        "routing_reason":   _routing_reason,
-                    })
-                    _log.info(
-                        "realtime_intent_routed provider=%s signals=%s",
-                        rt_cloud.provider, _rt.signals,
-                        extra={
-                            "req_id":         req_id,
-                            "provider":       rt_cloud.provider,
-                            "skill":          skill,
-                            "signals":        _rt.signals,
-                            "routing_reason": _routing_reason,
-                        },
-                    )
-                    _session_update(req.session_id, req.query, rt_cloud.answer)
-                    return QueryResponse(
-                        answer=rt_cloud.answer,
-                        source=rt_cloud.provider,
-                        model_used=rt_cloud.model,
-                        skill=skill,
-                        latency_ms=total_ms,
-                        confidence_score=None,
-                        tokens=tokens,
-                        session_id=req.session_id,
-                        realtime_intent=True,
-                        realtime_signals=_rt.signals,
-                        routing_reason=_routing_reason,
-                    )
-                except cloud_llms.ProviderError as rt_exc:
-                    if _router._is_billing_error(rt_exc):
-                        _router._mark_degraded(selected)
-                    _log.warning(
-                        "realtime_provider_failed provider=%s falling_through",
-                        selected,
-                        extra={"provider": selected, "error": str(rt_exc)},
-                    )
-                    # Fall through to normal local->cloud routing
-
-        if req.force_cloud:
-            cloud = await _router.skill_router.dispatch(req.query, skill, req.system, context_messages)
-            total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
-            tokens   = TokenBreakdown(
-                input=cloud.input_tokens,
-                output=cloud.output_tokens,
-                total=cloud.input_tokens + cloud.output_tokens,
-            )
-            status = "fallback" if cloud.provider == "error" else "success"
-            _stats.record({
-                "ts":               datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                "session_id":       req.session_id,
-                "source":           cloud.provider,
-                "model_used":       cloud.model,
-                "skill":            skill,
-                "latency_ms":       total_ms,
-                "confidence_score": None,
-                "tokens":           tokens.model_dump(),
-                "status":           status,
-            })
-            _log.info(
-                "routed",
-                extra={
-                    "req_id":           req_id,
-                    "session_id":       req.session_id,
-                    "source":           cloud.provider,
-                    "model":            cloud.model,
-                    "skill":            skill,
-                    "cloud_latency_ms": cloud.latency_ms,
-                    "total_latency_ms": total_ms,
-                    "tokens":           tokens.model_dump(),
-                    "forced_cloud":     True,
-                    "status":           status,
-                },
-            )
-            _session_update(req.session_id, req.query, cloud.answer)
-            return QueryResponse(
-                answer=cloud.answer,
-                source=cloud.provider,
-                model_used=cloud.model,
-                skill=skill,
-                latency_ms=total_ms,
-                confidence_score=None,
-                tokens=tokens,
-                session_id=req.session_id,
-            )
-
-        # ── Local-first / escalate — shared with /query/stream ───────────────
-        result = await _resolve_query(req.query, req.system, context_messages, skill, req_id=req_id)
+    def respond(result: _ResolvedQuery, realtime_signals: list[str] | None = None) -> QueryResponse:
         total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
         tokens   = TokenBreakdown(
             input=result.input_tokens,
             output=result.output_tokens,
             total=result.input_tokens + result.output_tokens,
         )
-        if result.source == "local":
-            _cache_put(req.query, {
-                "answer":           result.answer,
-                "source":           "local",
-                "model_used":       result.model,
-                "skill":            skill,
-                "confidence_score": result.confidence,
-                "tokens":           tokens.model_dump(),
-            }, skill, result.confidence)
-            status = "retry_success" if result.retry else "success"
+        _cache_local_result(req.query, result, skill)
+        if result.source == "error" or result.fallback_used:
+            status = "fallback"
+        elif result.retry:
+            status = "retry_success"
         else:
-            status = "fallback" if result.source == "error" else "success"
-        _stats.record({
+            status = "success"
+        route = result.route()
+        record = {
             "ts":               datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             "session_id":       req.session_id,
             "source":           result.source,
@@ -890,7 +920,13 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
             "confidence_score": result.confidence,
             "tokens":           tokens.model_dump(),
             "status":           status,
-        })
+            "tier":             route["tier"],
+            "fallback_used":    result.fallback_used,
+            "routing_reason":   result.route_reason,
+        }
+        if realtime_signals is not None:
+            record.update(realtime_intent=True, realtime_signals=realtime_signals)
+        _stats.record(record)
         _log.info(
             "routed",
             extra={
@@ -902,8 +938,11 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
                 "cloud_latency_ms": result.cloud_latency_ms,
                 "total_latency_ms": total_ms,
                 "tokens":           tokens.model_dump(),
-                "forced_cloud":     False,
+                "forced_cloud":     req.force_cloud,
                 "status":           status,
+                "tier":             route["tier"],
+                "fallback_used":    result.fallback_used,
+                "route_reason":     result.route_reason,
             },
         )
         _session_update(req.session_id, req.query, result.answer)
@@ -916,7 +955,31 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
             confidence_score=result.confidence,
             tokens=tokens,
             session_id=req.session_id,
+            realtime_intent=realtime_signals is not None,
+            realtime_signals=realtime_signals or [],
+            routing_reason=result.route_reason,
+            **route,
         )
+
+    try:
+        # ── Realtime intent — CLOUD lane with live search; mini/Jetson if it's down ──
+        _rt = classify_intent(req.query)
+        if _rt.is_realtime and not req.force_cloud:
+            result = await _realtime_lane(
+                req.query, req.system, context_messages, skill,
+                _rt.signals, _rt.preferred_provider, req_id,
+            )
+            return respond(result, realtime_signals=_rt.signals)
+
+        if req.force_cloud:
+            result = await _cloud_lane(
+                req.query, req.system, context_messages, skill, req_id, reason="force_cloud",
+            )
+            return respond(result)
+
+        # ── Local-first / escalate — shared with /query/stream ───────────────
+        result = await _resolve_query(req.query, req.system, context_messages, skill, req_id=req_id)
+        return respond(result)
 
     except httpx.HTTPError as exc:
         # Local Ollama unreachable
@@ -941,6 +1004,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
                 "confidence_score": None,
                 "tokens": {"input": 0, "output": 0, "total": 0},
                 "session_id": req.session_id,
+                **_ERROR_ROUTE,
             },
         )
     except ValueError as exc:
@@ -968,6 +1032,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
                 "confidence_score": None,
                 "tokens": {"input": 0, "output": 0, "total": 0},
                 "session_id": req.session_id,
+                **_ERROR_ROUTE,
             },
         )
 
@@ -995,7 +1060,9 @@ async def _heartbeat_until_done(task: asyncio.Task, interval: float = 15.0):
 
 
 def _cache_local_result(query: str, result: "_ResolvedQuery", skill: str) -> None:
-    if result.source != "local":
+    # A Jetson answer given only because the cloud was down isn't cached, so the
+    # next ask goes to the cloud again once it's back.
+    if result.source != "local" or result.fallback_used:
         return
     _cache_put(query, {
         "answer":           result.answer,
@@ -1032,6 +1099,7 @@ def _stream_metadata(result: "_ResolvedQuery", skill: str, t_wall: float) -> dic
         metadata["retry"] = True
     if result.escalated:
         metadata["escalated"] = True
+    metadata.update(result.route())
     return metadata
 
 
@@ -1068,6 +1136,7 @@ async def query_stream_endpoint(req: QueryRequest):
                 "prompt_tokens":     cached["tokens"]["input"],
                 "completion_tokens": cached["tokens"]["output"],
                 "cache_hit":         True,
+                **_cached_route(cached),
             }
             yield f"data: {json.dumps({'token': '', 'done': True, 'metadata': metadata})}\n\n"
             _session_update(req.session_id, req.query, cached["answer"])
@@ -1080,32 +1149,34 @@ async def query_stream_endpoint(req: QueryRequest):
     skill = _router.skill_router.classify(req.query)
     context_messages = _session_context(req.session_id, req.messages)
 
-    # Realtime intent — route to cloud and fake-stream the response for UX continuity
+    # Realtime intent — CLOUD lane with live search (mini/Jetson if it's down),
+    # fake-streamed for UX continuity
     _rt_s = classify_intent(req.query)
     if _rt_s.is_realtime:
-        preferred = _rt_s.preferred_provider
-        available = [p for p in ["grok", "openai", "claude"] if not _router._is_degraded(p)]
-        selected  = preferred if preferred in available else (available[0] if available else None)
-        if selected:
-            _signals = _rt_s.signals
-            async def realtime_cloud_stream():
-                try:
-                    cloud = await cloud_llms.query(selected, req.query, req.system, messages=context_messages)
-                    async for chunk in _fake_stream_text(cloud.answer):
-                        yield chunk
-                    yield f"data: {json.dumps({'token': '', 'done': True, 'metadata': {'routed_to': cloud.provider, 'source': cloud.provider, 'model_used': cloud.model, 'skill': skill, 'confidence_score': None, 'latency_ms': cloud.latency_ms, 'tokens': {'input': cloud.input_tokens, 'output': cloud.output_tokens, 'total': cloud.input_tokens + cloud.output_tokens}, 'realtime_intent': True, 'realtime_signals': _signals}})}\n\n"
-                    _session_update(req.session_id, req.query, cloud.answer)
-                except Exception as exc:
-                    if isinstance(exc, cloud_llms.ProviderError) and _router._is_billing_error(exc):
-                        _router._mark_degraded(selected)
-                    _log.warning("stream_realtime_failed provider=%s", selected, extra={"provider": selected, "error": str(exc)})
-                    async for chunk in local_llm.generate_stream(req.query, req.system, context_messages, skill=skill):
-                        yield chunk
-            return StreamingResponse(
-                realtime_cloud_stream(),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-            )
+        async def realtime_stream():
+            task = asyncio.ensure_future(_realtime_lane(
+                req.query, req.system, context_messages, skill,
+                _rt_s.signals, _rt_s.preferred_provider, req_id,
+            ))
+            try:
+                async for heartbeat in _heartbeat_until_done(task):
+                    yield heartbeat
+                result = task.result()
+            except Exception as exc:
+                _log.error("stream_realtime_failed req_id=%s error=%s", req_id, exc)
+                yield f"data: {json.dumps({'error': True, 'message': str(exc)[:200], 'provider': 'cloud', 'done': True})}\n\n"
+                return
+            async for chunk in _fake_stream_text(result.answer):
+                yield chunk
+            metadata = _stream_metadata(result, skill, t_wall)
+            metadata.update(realtime_intent=True, realtime_signals=_rt_s.signals)
+            yield f"data: {json.dumps({'token': '', 'done': True, 'metadata': metadata})}\n\n"
+            _session_update(req.session_id, req.query, result.answer)
+        return StreamingResponse(
+            realtime_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     # Local-only skills never escalate regardless of confidence — stream Ollama live.
     if skill in _router.LOCAL_ONLY_SKILLS:
@@ -1120,6 +1191,12 @@ async def query_stream_endpoint(req: QueryRequest):
                             payload = json.loads(chunk[6:])
                             if payload.get("token"):
                                 answer_parts.append(payload["token"])
+                            if payload.get("done") and isinstance(payload.get("metadata"), dict):
+                                payload["metadata"].update(tiers.RouteInfo(
+                                    tier=tiers.LOCAL, model=config.OLLAMA_MODEL,
+                                    route_reason=f"local_only_skill:{skill}",
+                                ).fields())
+                                chunk = f"data: {json.dumps(payload)}\n\n"
                         except json.JSONDecodeError:
                             pass
                     yield chunk
@@ -1215,6 +1292,7 @@ async def ask_stream_endpoint(req: QueryRequest):
                     "latency_ms":       round((time.monotonic() - t_wall) * 1000),
                     "tokens":           cached["tokens"],
                     "cache_hit":        True,
+                    **_cached_route(cached),
                 })
                 return
 
@@ -1231,46 +1309,19 @@ async def ask_stream_endpoint(req: QueryRequest):
                     run=run, label="local" if calls == 1 else "retry",
                 )
 
-            # Realtime intent goes straight to cloud, as in /query/stream; if that
-            # fails, answer with a single live local pass.
+            # Realtime intent goes to the CLOUD lane with live search, as in
+            # /query/stream; if the cloud is down, the mini, then a live local pass.
             _rt_s = classify_intent(req.query)
             if _rt_s.is_realtime:
-                preferred = _rt_s.preferred_provider
-                available = [p for p in ["grok", "openai", "claude"] if not _router._is_degraded(p)]
-                selected  = preferred if preferred in available else (available[0] if available else None)
-                if selected:
-                    try:
-                        cloud = await cloud_llms.query(selected, req.query, req.system, messages=context_messages)
-                        run.replace(cloud.answer, source=cloud.provider)
-                        finish(run, cloud.answer, {
-                            "routed_to":        cloud.provider,
-                            "source":           cloud.provider,
-                            "model_used":       cloud.model,
-                            "skill":            skill,
-                            "confidence_score": None,
-                            "latency_ms":       cloud.latency_ms,
-                            "tokens": {
-                                "input":  cloud.input_tokens,
-                                "output": cloud.output_tokens,
-                                "total":  cloud.input_tokens + cloud.output_tokens,
-                            },
-                            "realtime_intent":  True,
-                            "realtime_signals": _rt_s.signals,
-                        })
-                        return
-                    except Exception as exc:
-                        if isinstance(exc, cloud_llms.ProviderError) and _router._is_billing_error(exc):
-                            _router._mark_degraded(selected)
-                        _log.warning("ask_realtime_failed provider=%s", selected, extra={"provider": selected, "error": str(exc)})
-                        local = await local_query(req.query, req.system, context_messages, skill)
-                        result = _ResolvedQuery(
-                            source="local", answer=local["answer"], model=local["model"],
-                            confidence=local["confidence"],
-                            input_tokens=local["prompt_tokens"], output_tokens=local["completion_tokens"],
-                        )
-                        run.replace(result.answer, source="local")
-                        finish(run, result.answer, _stream_metadata(result, skill, t_wall))
-                        return
+                result = await _realtime_lane(
+                    req.query, req.system, context_messages, skill,
+                    _rt_s.signals, _rt_s.preferred_provider, req_id, local_query=local_query,
+                )
+                run.replace(result.answer, source=result.source)
+                metadata = _stream_metadata(result, skill, t_wall)
+                metadata.update(realtime_intent=True, realtime_signals=_rt_s.signals)
+                finish(run, result.answer, metadata)
+                return
 
             result = await _resolve_query(
                 req.query, req.system, context_messages, skill,
@@ -1562,6 +1613,74 @@ async def providers_status_endpoint() -> dict:
         extra={"statuses": {k: v["status"] for k, v in response["providers"].items()}},
     )
     return response
+
+
+# ---------------------------------------------------------------------------
+# GET /tiers/status  — health of each routing lane (tiers.py)
+# ---------------------------------------------------------------------------
+
+@app.get("/tiers/status")
+async def tiers_status_endpoint() -> dict:
+    """LOCAL (Jetson) and PRIVATE (mini) are probed via Ollama /api/tags, cached 15s.
+    CLOUD reports configured providers minus degraded ones."""
+    return await tiers.status()
+
+
+# ---------------------------------------------------------------------------
+# POST /jobs/generate  — batch / background work, always the PRIVATE lane
+# ---------------------------------------------------------------------------
+
+class JobRequest(BaseModel):
+    prompt: str = Field(..., min_length=1)
+    system: str = ""
+    format: dict | str | None = Field(None, description='"json" or a JSON schema for structured output.')
+    num_predict: int = Field(600, ge=1, le=8192)
+    temperature: float = Field(0.2, ge=0.0, le=2.0)
+
+
+@app.post("/jobs/generate")
+async def jobs_generate_endpoint(req: JobRequest, request: Request) -> JSONResponse:
+    """Runs on the mini only: no cloud and no Jetson fallback, so it fails closed
+    (503) when the mini is unset or down. Needs a private identity (allow-listed
+    Firebase email or PRIVATE_TOKEN). Logs metadata only, never prompt or answer."""
+    req_id = uuid.uuid4().hex[:8]
+    try:
+        identity = await auth.private_identity(request.headers.get("authorization", ""))
+    except auth.Forbidden as exc:
+        return JSONResponse(status_code=403, content={"error": "forbidden", "detail": exc.detail})
+    except auth.AuthError as exc:
+        return JSONResponse(
+            status_code=401, content={"error": "unauthorized", "detail": exc.detail},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    route = tiers.RouteInfo(tier=tiers.PRIVATE, model=config.MINI_MODEL, private=True, route_reason="batch_job")
+    try:
+        mini = await tiers.mini_generate(
+            req.prompt, req.system,
+            num_predict=req.num_predict, temperature=req.temperature, format=req.format,
+        )
+    except tiers.MiniUnavailable as exc:
+        _log.warning("job_failed", extra={"req_id": req_id, "identity": identity, "error": str(exc)})
+        return JSONResponse(
+            status_code=503,
+            content={"error": "private_lane_unavailable", "detail": str(exc), **route.fields(), "tier": None},
+        )
+    _log.info(
+        "job_done",
+        extra={
+            "req_id": req_id, "identity": identity, "model": mini.model,
+            "input_tokens": mini.input_tokens, "output_tokens": mini.output_tokens,
+            "latency_ms": mini.latency_ms,
+        },
+    )
+    return JSONResponse(content={
+        "answer": mini.answer,
+        "tokens": {"input": mini.input_tokens, "output": mini.output_tokens,
+                   "total": mini.input_tokens + mini.output_tokens},
+        "latency_ms": mini.latency_ms,
+        **route.fields(),
+    })
 
 
 # ---------------------------------------------------------------------------

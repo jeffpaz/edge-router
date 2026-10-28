@@ -67,3 +67,30 @@ AUTH_ENABLED = os.getenv("AUTH_ENABLED", "false").lower() == "true"
 # is logged, but the request is allowed through regardless — a safe observation
 # window before flipping enforcement on.
 AUTH_REQUIRED = os.getenv("AUTH_REQUIRED", "false").lower() == "true"
+
+# ── Private-lane access (see auth.private_identity) ──────────────────────────
+# Public chat stays open; the PRIVATE lane (/jobs now, private mode and personal
+# docs later) needs a Firebase ID token for a verified email in this list, or the
+# static PRIVATE_TOKEN for scripts. Both empty → nobody gets in (fail closed).
+PRIVATE_ALLOWED_EMAILS: frozenset[str] = frozenset(
+    e.strip().lower() for e in os.getenv("PRIVATE_ALLOWED_EMAILS", "").split(",") if e.strip()
+)
+PRIVATE_TOKEN = os.getenv("PRIVATE_TOKEN", "")
+
+# ── Tiered routing (see tiers.py) ────────────────────────────────────────────
+# PRIVATE lane: Ollama on the Mac mini. Either unset → the lane is disabled and
+# anything that needs it fails closed.
+MINI_OLLAMA_URL = os.getenv("MINI_OLLAMA_URL", "").rstrip("/")
+MINI_MODEL      = os.getenv("MINI_MODEL", "")
+# Must match the mini daemon's OLLAMA_CONTEXT_LENGTH and TRIPBUDDY_OLLAMA_NUM_CTX,
+# so every caller shares one loaded runner instead of forcing reloads.
+MINI_NUM_CTX    = int(os.getenv("MINI_NUM_CTX", "8192"))
+MINI_TIMEOUT_S  = float(os.getenv("MINI_TIMEOUT_S", "120"))
+
+# Total time the CLOUD lane gets (whole provider fallback chain) before the
+# answer falls back to the mini, then the Jetson.
+CLOUD_LANE_TIMEOUT_S = float(os.getenv("CLOUD_LANE_TIMEOUT_S", "60"))
+
+# Grok model for live-data questions, called through the Responses API with the
+# server-side web_search / x_search tools (xAI retired `search_parameters`).
+GROK_SEARCH_MODEL = os.getenv("GROK_SEARCH_MODEL", "grok-4.20-0309-non-reasoning")
