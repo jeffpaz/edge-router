@@ -4,6 +4,42 @@ All notable changes to edge-router are documented here.
 
 ---
 
+## 2026-10-25
+
+### Added
+- **`POST /ask/stream`** (#3): the same local-first routing as `/query` (realtime bypass, cache, local pass, local-first retry, cloud escalation via `_resolve_query()`), but each local Ollama pass streams token by token. It interleaves named SSE events (`event: <kind>` + `data: <json>`) for the pazlabs.io "This run" telemetry panel:
+  - `call`: an Ollama call started, labelled `local` or `retry`.
+  - `token`: live answer text.
+  - `metrics`, about 8/s: CPU %, GPU %, RAM MB, cumulative output tokens, tok/s over the trailing second, and a KV-cache estimate.
+  - `phases`, once per Ollama call: Ollama's `load_duration`, `prompt_eval_duration` and `eval_duration`, the prompt/eval counts, and wall time.
+  - `replace`: swaps the answer text when a retry starts, when the cleaned final answer arrives, or for a cloud answer.
+  - `done`: the same metadata as `/query/stream`'s final frame, plus total wall time.
+  - `error`.
+- **`telemetry.py`** (#3): a per-request `tegrastats --interval 125` sampler, run through the host binary at `/host_root/usr/bin/tegrastats`. It parses `GR3D_FREQ`, RAM used, and the mean of the online cores' CPU %. On client disconnect, the response generator is cancelled inside an anyio scope where any `await` would itself be cancelled, so the subprocess is killed synchronously (SIGTERM, then SIGKILL after 1s) when the request ends; a disconnect can't leave tegrastats running.
+- **KV-cache estimate** (#3): `(prompt tokens + tokens so far) × 2 × layers × kv_heads × head_dim × 2 bytes (f16)`.
+  - Specs live in `telemetry.MODEL_SPECS`: `llama3.2:3b` (28, 8, 128) and `gemma2:2b` (26, 4, 256). Other models emit `kv: null`.
+  - Prompt tokens are estimated at about 4 characters each until Ollama reports `prompt_eval_count`.
+- **`local_llm.query_streaming()`** (#3): the same contract and scoring as `query()`, but it streams the Ollama call and reports each token and the final timings to the request's `telemetry.Run`. `_TagFilter` holds back text that might be the start of the `CONFIDENCE: N` self-rating tag, so it never shows up in the live answer.
+- **`POST /brain/query`** (#4): read-only PazBrain Logseq queries.
+  - Six allow-listed operations (`search_page`, `search_block`, `show_page`, `list_task`, `recent_updated`, `task_search`), with the same read auth as `/brain/api`.
+  - Rate limited per caller via `PAZBRAIN_QUERY_RATE_PER_MIN` (default 30).
+  - Requests are forwarded over a unix socket to a host sidecar (`pazbrain/scripts/brain_query.py`, `pazbrain-query.service`). The sidecar validates again and runs the logseq CLI with fixed argument lists, so nothing reachable from HTTP can write.
+- **`pazbrain/scripts/logseq_ingest.py`** (#4): a one-way, idempotent mirror of the wiki into the Logseq "pazbrain" graph, keyed by each source file's sha256. `pazbrain_sync.py` runs it after every sync, and a Logseq failure never fails the wiki sync.
+
+### Changed
+- **Every Ollama call sends the same runner options** (#3): `num_ctx` 4096 and `num_thread` 6. This covers `/query`, `/query/stream`, `/ask/stream`, the retry pass, the keep-alive ping and the startup warm-up. Ollama reloads the model whenever a runner option differs from the loaded runner. Before this, conversational skills used `num_ctx` 2048 and everything else 4096, and the keep-alive ping sent no options at all, so mixed traffic kept reloading the model.
+  - **This changes `/query` and `/query/stream`:** conversational skills now get `num_ctx` 4096.
+  - `num_predict`, a sampling option that never triggers a reload, still varies by skill.
+- **`keep_alive: -1` on every Ollama request** (#3), replacing `"10m"` on the keep-alive ping and Ollama's default on real calls.
+  - `docker-compose.yml`'s `ollama` block now sets `OLLAMA_KEEP_ALIVE: "-1"`.
+  - The live `ollama` container runs outside compose (`docker run`). It was recreated with `OLLAMA_KEEP_ALIVE=-1` and otherwise identical mounts and env.
+  - Verified on the Jetson: a cold first local query reported `load_duration` 5.81s, and the next local query 0.51s, with no reload. `ollama ps` shows `4096 · Forever`.
+- **Startup warm-up timeout raised from 10s to 60s** (#3). A cold load of `llama3.2:3b` takes about 6s, so the warm-up was timing out (`ollama_warmup_failed` with an empty error) and the first real query paid the load instead.
+- **`local_llm.py`: confidence scoring factored out of `query()`** (#3) into `_score()`, with `_full_prompt()`, `_failed_result()` and `_parse_logprobs()` helpers, so `query()` and `query_streaming()` route identically. `_resolve_query()` in `main.py` takes a `local_query` callable, which defaults to `local_llm.query`. The cache-put for local answers moved into `_cache_local_result()`, which both stream endpoints share.
+- **Auth middleware** (#3): `/ask*` was added to `_AUTH_PROTECTED_PREFIXES` alongside `/query*`. It's still dormant unless `AUTH_ENABLED` is set.
+
+---
+
 ## 2026-07-18
 
 ### Added
