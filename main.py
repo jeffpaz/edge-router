@@ -26,6 +26,7 @@ import auth
 import cloud_llms
 import config
 import local_llm
+import privacy
 import router as _router
 import telemetry
 import tiers
@@ -562,6 +563,11 @@ class QueryRequest(BaseModel):
     system: str = Field("", description="Optional system prompt forwarded to whichever LLM answers.")
     session_id: str | None = Field(None, description="Optional session identifier from the client.")
     messages: list = Field(default_factory=list, description="Conversation history.")
+    private: bool = Field(
+        False,
+        description="Stay private / local: never use a cloud provider (mini, then Jetson). "
+                    "Needs a private identity (auth.private_identity).",
+    )
 
 
 class TokenBreakdown(BaseModel):
@@ -844,11 +850,124 @@ async def _fallback_after_cloud(
 
 
 # ---------------------------------------------------------------------------
+# PRIVATE lane — private: true requests
+# ---------------------------------------------------------------------------
+# Two independent guards keep these off the cloud: _private_lane() has no cloud
+# client in it at all, and it runs inside privacy.private_scope(), so any cloud
+# call that slipped in anyway raises PrivateLeakError before touching the network.
+# Private requests are never cached, never stored in the server-side session,
+# and never logged with query or answer text.
+
+async def _private_denial(request: Request, req_id: str) -> JSONResponse | None:
+    """None when the caller may use private mode, else the 401/403 response."""
+    try:
+        identity = await auth.private_identity(request.headers.get("authorization", ""))
+    except auth.Forbidden as exc:
+        status, body = 403, {"error": "forbidden", "detail": exc.detail}
+    except auth.AuthError as exc:
+        status, body = 401, {"error": "unauthorized", "detail": exc.detail}
+    else:
+        _log.info("private_request", extra={"req_id": req_id, "identity": identity})
+        return None
+    _log.warning("private_denied", extra={"req_id": req_id, "status": status})
+    route = tiers.RouteInfo(tier=None, model="none", private=True, route_reason="private_denied").fields()
+    return JSONResponse(
+        status_code=status,
+        content={**body, "answer": "Private mode is only available to the allow-listed account.", **route},
+        headers={"WWW-Authenticate": "Bearer"} if status == 401 else None,
+    )
+
+
+async def _private_lane(
+    query: str, system: str, messages: list, skill: str, req_id: str = "", *,
+    live_data: bool, local_query=None,
+) -> _ResolvedQuery:
+    """private: true — the mini, then the Jetson, then a clear error. Never cloud.
+    A live-data question is answered locally with limitation="live_data_unavailable"."""
+    try:
+        mini = await tiers.mini_generate(
+            query, system, messages, num_predict=local_llm._SKILL_NUM_PREDICT.get(skill, 600),
+        )
+    except tiers.MiniUnavailable as exc:
+        _log.warning("private_mini_unavailable", extra={"req_id": req_id, "error": str(exc)})
+        local = await (local_query or local_llm.query)(query, system, messages, skill=skill)
+        if local["answer"]:
+            result = _ResolvedQuery(
+                source="local", answer=local["answer"], model=local["model"],
+                confidence=local["confidence"],
+                input_tokens=local["prompt_tokens"], output_tokens=local["completion_tokens"],
+                private=True, fallback_used=True,
+                route_reason=f"private; mini unavailable ({exc}) -> jetson",
+            )
+        else:
+            result = _ResolvedQuery(
+                source="error",
+                answer="Private mode couldn't reach the Mac mini or the Jetson, and it never uses "
+                       "the cloud. Please try again.",
+                model="none", confidence=None, input_tokens=0, output_tokens=0,
+                private=True, fallback_used=True,
+                route_reason=f"private; mini unavailable ({exc}); jetson unavailable",
+            )
+    else:
+        result = _ResolvedQuery(
+            source="mini", answer=mini.answer, model=mini.model, confidence=None,
+            input_tokens=mini.input_tokens, output_tokens=mini.output_tokens,
+            private=True, route_reason="private -> mini",
+        )
+    if live_data and result.source != "error":
+        result.limitation = "live_data_unavailable"
+    _log.info(
+        "routed",
+        extra={
+            "req_id": req_id, "private": True, "tier": tiers.tier_of(result.source),
+            "model": result.model, "skill": skill, "fallback_used": result.fallback_used,
+            "route_reason": result.route_reason, "limitation": result.limitation,
+            "tokens": {"input": result.input_tokens, "output": result.output_tokens},
+        },
+    )
+    return result
+
+
+def _private_query_response(result: _ResolvedQuery, req: "QueryRequest", skill: str, t_wall: float) -> QueryResponse:
+    total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
+    tokens = TokenBreakdown(
+        input=result.input_tokens, output=result.output_tokens,
+        total=result.input_tokens + result.output_tokens,
+    )
+    route = result.route()
+    _stats.record({
+        "ts":               datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        "session_id":       req.session_id,
+        "source":           result.source,
+        "model_used":       result.model,
+        "skill":            skill,
+        "latency_ms":       total_ms,
+        "confidence_score": result.confidence,
+        "tokens":           tokens.model_dump(),
+        "status":           "fallback" if result.source == "error" or result.fallback_used else "success",
+        "tier":             route["tier"],
+        "private":          True,
+    })
+    return QueryResponse(
+        answer=result.answer,
+        source=result.source,
+        model_used=result.model,
+        skill=skill,
+        latency_ms=total_ms,
+        confidence_score=result.confidence,
+        tokens=tokens,
+        session_id=req.session_id,
+        routing_reason=result.route_reason,
+        **route,
+    )
+
+
+# ---------------------------------------------------------------------------
 # POST /query
 # ---------------------------------------------------------------------------
 
 @app.post("/query", response_model=QueryResponse)
-async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
+async def query_endpoint(req: QueryRequest, request: Request) -> QueryResponse | JSONResponse:
     req_id = uuid.uuid4().hex[:8]
     t_wall = time.perf_counter()
 
@@ -857,10 +976,24 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse | JSONResponse:
         extra={
             "req_id": req_id,
             "session_id": req.session_id,
-            "query_preview": req.query[:120],
+            "query_preview": None if req.private else req.query[:120],
             "force_cloud": req.force_cloud,
+            "private": req.private,
         },
     )
+
+    # ── Private: PRIVATE lane only (mini → Jetson), no cache, no session store ──
+    if req.private:
+        denial = await _private_denial(request, req_id)
+        if denial is not None:
+            return denial
+        skill = _router.skill_router.classify(req.query)
+        with privacy.private_scope():
+            result = await _private_lane(
+                req.query, req.system, _session_context(req.session_id, req.messages), skill, req_id,
+                live_data=classify_intent(req.query).is_realtime,
+            )
+        return _private_query_response(result, req, skill, t_wall)
 
     # ── Cache check — return immediately on hit, skip all inference ──────────
     if not req.force_cloud:
@@ -1062,7 +1195,7 @@ async def _heartbeat_until_done(task: asyncio.Task, interval: float = 15.0):
 def _cache_local_result(query: str, result: "_ResolvedQuery", skill: str) -> None:
     # A Jetson answer given only because the cloud was down isn't cached, so the
     # next ask goes to the cloud again once it's back.
-    if result.source != "local" or result.fallback_used:
+    if result.source != "local" or result.fallback_used or result.private:
         return
     _cache_put(query, {
         "answer":           result.answer,
@@ -1104,7 +1237,7 @@ def _stream_metadata(result: "_ResolvedQuery", skill: str, t_wall: float) -> dic
 
 
 @app.post("/query/stream")
-async def query_stream_endpoint(req: QueryRequest):
+async def query_stream_endpoint(req: QueryRequest, request: Request):
     """Stream tokens as Server-Sent Events, escalating to cloud on low local confidence."""
     req_id = uuid.uuid4().hex[:8]
     t_wall = time.monotonic()
@@ -1114,9 +1247,42 @@ async def query_stream_endpoint(req: QueryRequest):
         extra={
             "req_id":        req_id,
             "session_id":    req.session_id,
-            "query_preview": req.query[:120],
+            "query_preview": None if req.private else req.query[:120],
+            "private":       req.private,
         },
     )
+
+    # ── Private: PRIVATE lane only, fake-streamed like the escalation path ───
+    if req.private:
+        denial = await _private_denial(request, req_id)
+        if denial is not None:
+            return denial
+        skill = _router.skill_router.classify(req.query)
+        context_messages = _session_context(req.session_id, req.messages)
+        live_data = classify_intent(req.query).is_realtime
+
+        async def private_stream():
+            with privacy.private_scope():
+                task = asyncio.ensure_future(_private_lane(
+                    req.query, req.system, context_messages, skill, req_id, live_data=live_data,
+                ))
+            try:
+                async for heartbeat in _heartbeat_until_done(task):
+                    yield heartbeat
+                result = task.result()
+            except Exception as exc:
+                _log.error("stream_private_failed req_id=%s error_type=%s", req_id, type(exc).__name__)
+                yield f"data: {json.dumps({'error': True, 'message': 'Private mode failed. Please try again.', 'provider': 'private', 'done': True})}\n\n"
+                return
+            async for chunk in _fake_stream_text(result.answer):
+                yield chunk
+            yield f"data: {json.dumps({'token': '', 'done': True, 'metadata': _stream_metadata(result, skill, t_wall)})}\n\n"
+
+        return StreamingResponse(
+            private_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     # ── Cache check — return immediately on hit, skip all inference ──────────
     cached = _cache_get(req.query)
@@ -1259,7 +1425,7 @@ async def query_stream_endpoint(req: QueryRequest):
 #   error    {message}
 
 @app.post("/ask/stream")
-async def ask_stream_endpoint(req: QueryRequest):
+async def ask_stream_endpoint(req: QueryRequest, request: Request):
     req_id = uuid.uuid4().hex[:8]
     t_wall = time.monotonic()
 
@@ -1268,14 +1434,42 @@ async def ask_stream_endpoint(req: QueryRequest):
         extra={
             "req_id":        req_id,
             "session_id":    req.session_id,
-            "query_preview": req.query[:120],
+            "query_preview": None if req.private else req.query[:120],
+            "private":       req.private,
         },
     )
+
+    if req.private:
+        denial = await _private_denial(request, req_id)
+        if denial is not None:
+            return denial
 
     def finish(run: telemetry.Run, answer: str, metadata: dict) -> None:
         run.emit("metrics", run.metrics())
         run.emit("done", {"metadata": metadata, "wall": round(run.elapsed(), 3)})
-        _session_update(req.session_id, req.query, answer)
+        if not req.private:
+            _session_update(req.session_id, req.query, answer)
+
+    async def private_pipeline(run: telemetry.Run) -> None:
+        """PRIVATE lane only: the mini, or a live Jetson pass if the mini is down."""
+        try:
+            skill = _router.skill_router.classify(req.query)
+
+            async def local_query(prompt: str, system: str, messages: list, skill: str) -> dict:
+                return await local_llm.query_streaming(prompt, system, messages, skill, run=run, label="local")
+
+            with privacy.private_scope():
+                result = await _private_lane(
+                    req.query, req.system, _session_context(req.session_id, req.messages), skill, req_id,
+                    live_data=classify_intent(req.query).is_realtime, local_query=local_query,
+                )
+            run.replace(result.answer, source=result.source)
+            finish(run, result.answer, _stream_metadata(result, skill, t_wall))
+        except Exception as exc:
+            _log.error("ask_private_failed req_id=%s error_type=%s", req_id, type(exc).__name__)
+            run.emit("error", {"message": "Private mode failed. Please try again."})
+        finally:
+            run.events.put_nowait(None)
 
     async def pipeline(run: telemetry.Run) -> None:
         try:
@@ -1340,7 +1534,7 @@ async def ask_stream_endpoint(req: QueryRequest):
         # Leaving this block — normal end, error, or the client disconnecting —
         # cancels the pipeline (closing the Ollama stream) and kills tegrastats.
         async with telemetry.Run(config.OLLAMA_MODEL) as run:
-            task = asyncio.create_task(pipeline(run))
+            task = asyncio.create_task((private_pipeline if req.private else pipeline)(run))
             try:
                 while (event := await run.events.get()) is not None:
                     yield event

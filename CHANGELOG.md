@@ -4,6 +4,23 @@ All notable changes to edge-router are documented here.
 
 ---
 
+## 2026-10-27
+
+### Added
+- **Private mode** (`"private": true` on `/query`, `/query/stream` and `/ask/stream`). The request goes only to the mini, then the Jetson, then a clear error, and never to a cloud provider. A live-data question is answered locally with `limitation: "live_data_unavailable"` and never reaches Grok. `force_cloud` is ignored.
+- **Two independent guards**:
+  1. `_private_lane()` has no cloud client in it.
+  2. `privacy.py` keeps a per-request flag (`private_scope()`). Every cloud call path calls `privacy.assert_cloud_allowed()` first and raises `PrivateLeakError` while the request is private: `cloud_llms.query()`, each `query_<provider>()`, and tripBuddy's Gemini and Grok calls.
+- **Access:** private mode needs `auth.private_identity()`, an allow-listed verified Firebase email or `PRIVATE_TOKEN`. Otherwise the request gets a 401 or 403 and no model runs.
+- **Nothing kept, nothing logged:** private requests skip the answer cache and the server-side session store. Every log line drops `query_preview`, logs `private: true`, and carries metadata only.
+- **Tests** (`tests/test_private.py`, with cloud clients mocked), asserting zero cloud calls for:
+  - a private general question and a private news question
+  - mini down → Jetson, and everything down → error
+  - `force_cloud`, and all three endpoints
+  - a simulated routing bug that sends a private request into the cloud lane
+
+  Other tests check that the query and answer text never appear in any log record.
+
 ## 2026-10-26
 
 ### Added
