@@ -10,11 +10,13 @@ daily caps are tripBuddy-only, so pazlabs.io routing is unaffected.
 """
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -48,10 +50,12 @@ _DEGRADED_TTL = 1800.0  # 30 minutes, same policy as router.py but a separate ta
 
 
 class TripProviderError(Exception):
-    def __init__(self, provider: str, message: str, status_code: int | None = None, quota: bool = False):
+    def __init__(self, provider: str, message: str, status_code: int | None = None, quota: bool = False,
+                 retry_after: float | None = None):
         self.provider = provider
         self.status_code = status_code
         self.quota = quota
+        self.retry_after = retry_after   # how long to sideline the provider; None → _DEGRADED_TTL
         super().__init__(f"[{provider}] {message}")
 
 
@@ -133,9 +137,31 @@ def is_degraded(provider: str) -> bool:
     return False
 
 
-def mark_degraded(provider: str) -> None:
-    _degraded[provider] = time.time() + _DEGRADED_TTL
-    _log.warning("trip_provider_degraded", extra={"provider": provider, "ttl_s": _DEGRADED_TTL})
+def mark_degraded(provider: str, ttl: float | None = None) -> None:
+    ttl = _DEGRADED_TTL if ttl is None else ttl
+    _degraded[provider] = time.time() + ttl
+    _log.warning("trip_provider_degraded", extra={"provider": provider, "ttl_s": round(ttl)})
+
+
+_PACIFIC = ZoneInfo("America/Los_Angeles")
+
+
+def gemini_limit(exc: Exception) -> tuple[str, float]:
+    """Which Gemini quota a 429 hit, from Google's error details, and how long to sideline Gemini for it.
+
+    The free tier has per-minute and per-day limits per model. A per-minute 429 used to sideline Gemini for 30
+    minutes (2026-10-31: three calls in three seconds, then Grok for the rest of the evening). Per minute: Google's
+    retryDelay, else 60 s. Per day: until midnight Pacific, when Google resets it. Unknown: the old 30 minutes.
+    """
+    text = f"{getattr(exc, 'details', '') or ''} {exc}"
+    delay = re.search(r"retryDelay['\"]?\s*:\s*['\"]?(\d+(?:\.\d+)?)s", text)
+    if re.search(r"PerMinute", text):
+        return "minute", float(delay.group(1)) if delay else 60.0
+    if re.search(r"PerDay", text):
+        now = datetime.now(_PACIFIC)
+        reset = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return "day", (reset - now).total_seconds()
+    return "unknown", _DEGRADED_TTL
 
 
 def is_configured(provider: str) -> bool:
@@ -213,6 +239,7 @@ async def query_gemini(prompt: str, system: str, json_output: bool, json_schema:
         cfg["response_mime_type"] = "application/json"
 
     last: Exception | None = None
+    limited: list[float] = []   # sideline time for each model that answered 429
     for model in GEMINI_MODELS:
         t0 = time.perf_counter()
         try:
@@ -231,13 +258,23 @@ async def query_gemini(prompt: str, system: str, json_output: bool, json_schema:
             )
         except errors.APIError as exc:
             code = getattr(exc, "code", None)
-            if code in (429, 401, 403):
+            if code in (401, 403):
                 raise TripProviderError("gemini", str(exc)[:300], code, quota=True) from exc
+            if code == 429:
+                # Quota is per model: try the next one before giving up on Gemini.
+                scope, wait = gemini_limit(exc)
+                _log.warning("trip_gemini_rate_limited", extra={"model": model, "limit": scope, "retry_s": round(wait),
+                                                                "error": f"{getattr(exc, 'details', '') or exc}"[:2000]})
+                limited.append(wait)
+                last = exc
+                continue
             # 404 (model retired for this key) / 5xx (high demand): try the next model
             _log.warning("trip_gemini_model_failed", extra={"model": model, "status_code": code})
             last = exc
         except Exception as exc:  # network, SDK
             last = exc
+    if limited:   # sidelined until the soonest model is free again
+        raise TripProviderError("gemini", f"rate limited: {last}"[:300], 429, quota=True, retry_after=min(limited)) from last
     raise TripProviderError("gemini", f"all models failed: {last}"[:300])
 
 

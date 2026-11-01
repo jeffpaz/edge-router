@@ -190,7 +190,7 @@ async def trip_query(
             res = await pt.PROVIDERS[dest](req.query, req.system, req.json_output, req.json_schema)
         except pt.TripProviderError as exc:
             if exc.quota:
-                pt.mark_degraded(dest)
+                pt.mark_degraded(dest, exc.retry_after)
             reasons.append(f"{dest}: {'quota/auth ' if exc.quota else ''}error {exc.status_code or ''}".strip())
             _log.warning("trip_provider_failed", extra={"provider": dest, "error": str(exc)[:300]})
             continue

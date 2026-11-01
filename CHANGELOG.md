@@ -4,6 +4,14 @@ All notable changes to edge-router are documented here.
 
 ---
 
+## 2026-10-31
+
+### Fixed
+- **tripBuddy's Gemini rate limits no longer sideline Gemini for 30 minutes** (`providers_trip.py`). The free tier limits each model per minute and per day, and any 429 used to mark Gemini degraded for 30 minutes, so one burst of three calls sent the rest of the evening to Grok.
+  - A 429 now tries the next Gemini model (each has its own quota) before giving up.
+  - When every model is limited, Gemini is sidelined only as long as the limit lasts: Google's `retryDelay` (or 60 s) for a per-minute limit, until midnight Pacific for a per-day limit, and the old 30 minutes when the error doesn't say (`gemini_limit`).
+  - Google's full error is logged (`trip_gemini_rate_limited`, up to 2,000 characters); it used to be cut at 300, before the quota details.
+
 ## 2026-10-27
 
 ### Added
