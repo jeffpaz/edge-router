@@ -100,3 +100,10 @@ MINI_RAG_TIMEOUT_S = float(os.getenv("MINI_RAG_TIMEOUT_S", "90"))
 # Grok model for live-data questions, called through the Responses API with the
 # server-side web_search / x_search tools (xAI retired `search_parameters`).
 GROK_SEARCH_MODEL = os.getenv("GROK_SEARCH_MODEL", "grok-4.20-0309-non-reasoning")
+
+# PazBrain remote MCP tool for Grok on "brain" questions (xAI Responses API, `type: "mcp"`).
+# The token is pazbrain-mcp client "grok-api" (tier cloud). Unset token -> no tool.
+PAZBRAIN_MCP_URL = os.getenv("PAZBRAIN_MCP_URL", "https://brain.pazlabs.io/mcp")
+PAZBRAIN_MCP_GROK_TOKEN = os.getenv("PAZBRAIN_MCP_GROK_TOKEN", "")
+# xAI's docs don't say whether `authorization` gets "Bearer " added; set after testing.
+PAZBRAIN_MCP_GROK_AUTH_PREFIX = os.getenv("PAZBRAIN_MCP_GROK_AUTH_PREFIX", "Bearer ")

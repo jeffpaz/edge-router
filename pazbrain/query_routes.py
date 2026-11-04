@@ -1,10 +1,14 @@
-"""POST /brain/query: read-only queries over the PazBrain Logseq graph (additive; included by main.py).
+"""POST /brain/query: read-only PazBrain queries (additive; included by main.py).
 
-The logseq CLI lives on the host, not in this container (a second CLI here would start its own
-db-worker-node on the same graph), so requests are validated here and forwarded to the host sidecar
-pazbrain/scripts/brain_query.py (pazbrain-query.service) over the unix socket in the /opt/pazbrain
-mount. The sidecar validates again and is the only thing that runs the CLI. Only the six operations
-below exist; nothing reachable from here can write to the graph or run raw datalog.
+op "search" runs in-process on lib/brain (the FTS5 index over wiki/, imported from the
+/opt/pazbrain mount). Tier "cloud" for anything that came through the Cloudflare Tunnel (public
+traffic: local-only pages are never returned); tier "local" only for requests made on the LAN.
+
+The other six ops query the Logseq graph. The logseq CLI lives on the host, not in this container
+(a second CLI here would start its own db-worker-node on the same graph), so requests are validated
+here and forwarded to the host sidecar pazbrain/scripts/brain_query.py (pazbrain-query.service)
+over the unix socket in the /opt/pazbrain mount. The graph has no visibility filter, so these ops
+are LAN-only: through the tunnel they return 403. Nothing reachable from here can write.
 
 Same auth as the PazBrain reads: read token, write token, or an allowlisted Firebase ID token.
 """
@@ -19,9 +23,11 @@ from collections import deque
 from typing import Annotated, Any, Literal, Optional, Union
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field
 
+from pazbrain import brain_context
 from pazbrain.security import require_read
 
 _log = logging.getLogger("edge_router.pazbrain")
@@ -38,6 +44,12 @@ Status = Literal["backlog", "canceled", "doing", "done", "in-review", "todo"]
 
 class _Op(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class Search(_Op):
+    op: Literal["search"]
+    q: str = Field(min_length=1, max_length=300, pattern=r"^[^\x00-\x1f\x7f]+$")
+    limit: int = Field(default=5, ge=1, le=20)
 
 
 class SearchPage(_Op):
@@ -75,7 +87,7 @@ class TaskSearch(_Op):
 
 
 BrainQuery = Annotated[
-    Union[SearchPage, SearchBlock, ShowPage, ListTask, RecentUpdated, TaskSearch],
+    Union[Search, SearchPage, SearchBlock, ShowPage, ListTask, RecentUpdated, TaskSearch],
     Field(discriminator="op"),
 ]
 
@@ -103,9 +115,23 @@ def _rate_limit(who: str) -> None:
         window.append(now)
 
 
-@router.post("/brain/query", summary="Read-only PazBrain graph query (allow-listed operations)")
-async def brain_query(body: BrainQuery, who: Annotated[str, Depends(require_read)]) -> dict[str, Any]:
+def _via_tunnel(request: Request) -> bool:
+    """cloudflared always adds cf-ray / cf-connecting-ip (same rule as pazbrain/routes.py)."""
+    return any(h in request.headers for h in ("cf-ray", "cf-connecting-ip"))
+
+
+@router.post("/brain/query", summary="Read-only PazBrain query: lib/brain search, or allow-listed graph ops (LAN)")
+async def brain_query(body: BrainQuery, request: Request, who: Annotated[str, Depends(require_read)]) -> dict[str, Any]:
     _rate_limit(who)
+    tunnel = _via_tunnel(request)
+    if body.op == "search":
+        tier = "cloud" if tunnel else "local"
+        hits = await run_in_threadpool(brain_context.search, body.q, tier=tier, limit=body.limit)
+        _log.info("brain_query", extra={"op": "search", "who": who, "tier": tier, "hits": len(hits)})
+        return {"op": "search", "tier": tier, "hits": hits}
+    if tunnel:
+        raise HTTPException(403, {"error": "lan_only", "detail": "Graph queries are LAN-only (they can't hide "
+                                  "local-only pages). Use op \"search\"."})
     try:
         async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=_SOCKET), timeout=_TIMEOUT_S) as client:
             resp = await client.post("http://brain-query/query", json=body.model_dump())

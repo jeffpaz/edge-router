@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timezone
 
 import cloud_llms
+from pazbrain import brain_context
 
 # ---------------------------------------------------------------------------
 # Logger  (NullHandler keeps this library-safe; callers configure output)
@@ -184,6 +185,8 @@ class SkillRouter:
     # Skill → (cloud_llms provider key, model ID)
     # Local-only skills are intentionally absent — they never reach cloud dispatch.
     _SKILL_MAP: dict[str, tuple[str, str]] = {
+        # Questions about Jeff's own notes: Grok, which can also search PazBrain itself (remote MCP)
+        "brain":          ("grok",   None),
         "coding":         ("claude", "claude-sonnet-4-20250514"),
         "math_data":      ("gemini", "gemini-2.0-flash"),
         "current_events":  ("grok",   None),
@@ -191,8 +194,16 @@ class SkillRouter:
         "general":        ("openai", "gpt-4o"),
     }
 
-    def classify(self, prompt: str) -> str:
-        """Return the skill label that best matches prompt, or 'general'."""
+    def classify(self, prompt: str, allow_brain: bool = False) -> str:
+        """Return the skill label that best matches prompt, or 'general'.
+
+        'brain' (questions about Jeff's own notes and projects) wins outright, but only with
+        allow_brain=True, which callers pass for the allow-listed account alone
+        (auth.private_identity). The caller then puts the top PazBrain hits in front of the
+        question (pazbrain/brain_context.py). Everyone else is classified as if 'brain' didn't exist.
+        """
+        if allow_brain and brain_context.is_brain_query(prompt):
+            return "brain"
         text = prompt.lower()
         scores: dict[str, int] = {
             skill: sum(1 for pat in patterns if re.search(pat, text))
@@ -259,7 +270,8 @@ class SkillRouter:
 
             try:
                 return await cloud_llms.query(
-                    attempt_provider, query, system, model=attempt_model, messages=messages
+                    attempt_provider, query, system, model=attempt_model, messages=messages,
+                    brain=skill == "brain",
                 )
             except cloud_llms.ProviderError as exc:
                 if _is_billing_error(exc):

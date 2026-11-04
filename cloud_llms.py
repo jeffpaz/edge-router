@@ -196,14 +196,37 @@ async def query_gemini(prompt: str, system: str = "", model: str | None = None, 
 _GROK_SEARCH_TOOLS = [{"type": "web_search"}, {"type": "x_search"}]
 
 
+def _grok_brain_tool() -> dict | None:
+    """xAI remote MCP tool (Responses API only): Grok searches PazBrain itself, as client
+    "grok-api" (tier cloud, so it never sees local-only pages). Read tools only: Grok gets no
+    brain_remember, so nothing it reads on the web can write into the inbox."""
+    if not (config.PAZBRAIN_MCP_URL and config.PAZBRAIN_MCP_GROK_TOKEN):
+        return None
+    return {
+        "type": "mcp",
+        "server_url": config.PAZBRAIN_MCP_URL,
+        "server_label": "pazbrain",
+        "server_description": "Jeff's personal wiki (PazBrain): people, projects, HOA, decisions.",
+        "allowed_tools": ["brain_search", "brain_read", "brain_index", "brain_recent"],
+        "authorization": config.PAZBRAIN_MCP_GROK_AUTH_PREFIX + config.PAZBRAIN_MCP_GROK_TOKEN,
+    }
+
+
 async def query_grok(
     prompt: str, system: str = "", model: str | None = None, messages: list = [], search: bool = False,
+    brain: bool = False,
 ) -> CloudResponse:
-    """Chat completion, or with search=True a Responses API call with web/X search."""
+    """Chat completion; with search=True and/or brain=True a Responses API call with web/X search
+    and/or the PazBrain remote MCP tool."""
     privacy.assert_cloud_allowed("grok")
     import openai
     from openai import AsyncOpenAI
 
+    tools = list(_GROK_SEARCH_TOOLS) if search else []
+    brain_tool = _grok_brain_tool() if brain else None
+    if brain_tool:
+        tools.append(brain_tool)
+    search = bool(tools)  # any server-side tool means the Responses API
     resolved = model or (config.GROK_SEARCH_MODEL if search else config.GROK_MODEL)
     client = AsyncOpenAI(api_key=config.XAI_API_KEY, base_url="https://api.x.ai/v1")
     api_messages = []
@@ -218,7 +241,7 @@ async def query_grok(
                 t0 = time.perf_counter()
                 if search:
                     response = await client.responses.create(
-                        model=resolved, input=api_messages, tools=_GROK_SEARCH_TOOLS,
+                        model=resolved, input=api_messages, tools=tools,
                     )
                     latency_ms = (time.perf_counter() - t0) * 1000
                     usage = response.usage
@@ -378,12 +401,23 @@ async def query(
     model: str | None = None,
     messages: list = [],
     search: bool = False,
+    brain: bool = False,
 ) -> CloudResponse:
-    """search=True asks for live web search; only Grok supports it, others ignore it."""
+    """search=True asks for live web search; brain=True gives Grok the PazBrain MCP tool.
+    Only Grok supports either; the others ignore them."""
     privacy.assert_cloud_allowed(provider)
     fn = _PROVIDERS.get(provider)
     if fn is None:
         raise ValueError(f"Unknown provider: {provider!r}. Choose from {list(_PROVIDERS)}")
-    if search and provider == "grok":
-        return await fn(prompt, system, model, messages, search=True)
+    if (search or brain) and provider == "grok":
+        try:
+            return await fn(prompt, system, model, messages, search=search, brain=brain)
+        except ProviderError as exc:
+            # xAI sometimes fails to reach the MCP server ("Failed to connect to MCP server"):
+            # answer without the tool rather than leave Grok; the top hits are already in the prompt.
+            if not brain or "MCP server" not in str(exc):
+                raise
+            _log.warning("grok_pazbrain_mcp_unreachable; retrying without the tool",
+                         extra={"provider": "grok", "error": str(exc)[:200]})
+            return await fn(prompt, system, model, messages, search=search)
     return await fn(prompt, system, model, messages)

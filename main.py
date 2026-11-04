@@ -32,6 +32,7 @@ import router as _router
 import telemetry
 import tiers
 from realtime_classifier import classify as classify_intent
+from pazbrain import brain_context
 
 
 # ---------------------------------------------------------------------------
@@ -964,7 +965,36 @@ async def _docs_lane(query: str, req_id: str = "") -> _ResolvedQuery:
 
 
 # Asked in private mode, these never need the user's documents: skip the index lookup
-_NO_DOCS_SKILLS = frozenset({"creative", "language_task"})
+# (brain questions are answered from the PazBrain wiki context instead)
+_NO_DOCS_SKILLS = frozenset({"creative", "language_task", "brain"})
+
+
+def _brain_prompt(query: str, skill: str, *, private: bool) -> tuple[str, list[dict]]:
+    """For skill "brain": the question with the top 5 PazBrain hits in front of it.
+
+    Tier "local" (local-only pages included) only for private requests, which never leave
+    the mini and the Jetson. Every other request gets tier "cloud": it may escalate to a cloud
+    LLM, so local-only pages must not be in its prompt."""
+    if skill != "brain":
+        return query, []
+    return brain_context.prompt_with_context(query, tier="local" if private else "cloud")
+
+
+async def _brain_allowed(request: Request) -> bool:
+    """The brain intent is for Jeff alone: the same allow-list as private mode (a verified,
+    allow-listed Firebase email or the private token). Anyone can make a pazlabs.io account,
+    so a valid sign-in isn't enough. Fails closed."""
+    try:
+        await auth.private_identity(request.headers.get("authorization", ""))
+        return True
+    except Exception:
+        return False
+
+
+def _with_brain_citations(result: "_ResolvedQuery", hits: list[dict]) -> "_ResolvedQuery":
+    if hits and not result.citations:
+        result.citations = brain_context.citations(hits)
+    return result
 
 
 async def _private_with_docs(
@@ -1050,16 +1080,17 @@ async def query_endpoint(req: QueryRequest, request: Request) -> QueryResponse |
         denial = await _private_denial(request, req_id)
         if denial is not None:
             return denial
-        skill = "personal_docs" if docs else _router.skill_router.classify(req.query)
+        skill = "personal_docs" if docs else _router.skill_router.classify(req.query, allow_brain=True)
+        prompt, brain_hits = _brain_prompt(req.query, skill, private=True)
         with privacy.private_scope():
             if docs:
                 result = await _docs_lane(req.query, req_id)
             else:
                 result = await _private_with_docs(
-                    req.query, req.system, _session_context(req.session_id, req.messages), skill, req_id,
+                    prompt, req.system, _session_context(req.session_id, req.messages), skill, req_id,
                     live_data=classify_intent(req.query).is_realtime,
                 )
-        return _private_query_response(result, req, skill, t_wall)
+        return _private_query_response(_with_brain_citations(result, brain_hits), req, skill, t_wall)
 
     # ── Cache check — return immediately on hit, skip all inference ──────────
     if not req.force_cloud:
@@ -1091,10 +1122,12 @@ async def query_endpoint(req: QueryRequest, request: Request) -> QueryResponse |
                 **_cached_route(cached),
             )
 
-    skill = _router.skill_router.classify(req.query)
+    skill = _router.skill_router.classify(req.query, allow_brain=await _brain_allowed(request))
     context_messages = _session_context(req.session_id, req.messages)
+    prompt, brain_hits = _brain_prompt(req.query, skill, private=False)
 
     def respond(result: _ResolvedQuery, realtime_signals: list[str] | None = None) -> QueryResponse:
+        _with_brain_citations(result, brain_hits)
         total_ms = round((time.perf_counter() - t_wall) * 1000, 1)
         tokens   = TokenBreakdown(
             input=result.input_tokens,
@@ -1157,6 +1190,7 @@ async def query_endpoint(req: QueryRequest, request: Request) -> QueryResponse |
             realtime_intent=realtime_signals is not None,
             realtime_signals=realtime_signals or [],
             routing_reason=result.route_reason,
+            citations=result.citations,
             **route,
         )
 
@@ -1165,19 +1199,19 @@ async def query_endpoint(req: QueryRequest, request: Request) -> QueryResponse |
         _rt = classify_intent(req.query)
         if _rt.is_realtime and not req.force_cloud:
             result = await _realtime_lane(
-                req.query, req.system, context_messages, skill,
+                prompt, req.system, context_messages, skill,
                 _rt.signals, _rt.preferred_provider, req_id,
             )
             return respond(result, realtime_signals=_rt.signals)
 
         if req.force_cloud:
             result = await _cloud_lane(
-                req.query, req.system, context_messages, skill, req_id, reason="force_cloud",
+                prompt, req.system, context_messages, skill, req_id, reason="force_cloud",
             )
             return respond(result)
 
         # ── Local-first / escalate — shared with /query/stream ───────────────
-        result = await _resolve_query(req.query, req.system, context_messages, skill, req_id=req_id)
+        result = await _resolve_query(prompt, req.system, context_messages, skill, req_id=req_id)
         return respond(result)
 
     except httpx.HTTPError as exc:
@@ -1263,6 +1297,8 @@ def _cache_local_result(query: str, result: "_ResolvedQuery", skill: str) -> Non
     # next ask goes to the cloud again once it's back.
     if result.source != "local" or result.fallback_used or result.private:
         return
+    if skill == "brain":  # built from Jeff's notes: the cache is keyed by text alone, never share it
+        return
     _cache_put(query, {
         "answer":           result.answer,
         "source":           "local",
@@ -1329,21 +1365,22 @@ async def query_stream_endpoint(req: QueryRequest, request: Request):
         denial = await _private_denial(request, req_id)
         if denial is not None:
             return denial
-        skill = "personal_docs" if docs else _router.skill_router.classify(req.query)
+        skill = "personal_docs" if docs else _router.skill_router.classify(req.query, allow_brain=True)
         context_messages = _session_context(req.session_id, req.messages)
         live_data = classify_intent(req.query).is_realtime
+        prompt, brain_hits = _brain_prompt(req.query, skill, private=True)
 
         async def private_stream():
             with privacy.private_scope():
                 task = asyncio.ensure_future(
                     _docs_lane(req.query, req_id) if docs else _private_with_docs(
-                        req.query, req.system, context_messages, skill, req_id, live_data=live_data,
+                        prompt, req.system, context_messages, skill, req_id, live_data=live_data,
                     )
                 )
             try:
                 async for heartbeat in _heartbeat_until_done(task):
                     yield heartbeat
-                result = task.result()
+                result = _with_brain_citations(task.result(), brain_hits)
             except Exception as exc:
                 _log.error("stream_private_failed req_id=%s error_type=%s", req_id, type(exc).__name__)
                 yield f"data: {json.dumps({'error': True, 'message': 'Private mode failed. Please try again.', 'provider': 'private', 'done': True})}\n\n"
@@ -1386,8 +1423,9 @@ async def query_stream_endpoint(req: QueryRequest, request: Request):
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    skill = _router.skill_router.classify(req.query)
+    skill = _router.skill_router.classify(req.query, allow_brain=await _brain_allowed(request))
     context_messages = _session_context(req.session_id, req.messages)
+    prompt, brain_hits = _brain_prompt(req.query, skill, private=False)
 
     # Realtime intent — CLOUD lane with live search (mini/Jetson if it's down),
     # fake-streamed for UX continuity
@@ -1395,13 +1433,13 @@ async def query_stream_endpoint(req: QueryRequest, request: Request):
     if _rt_s.is_realtime:
         async def realtime_stream():
             task = asyncio.ensure_future(_realtime_lane(
-                req.query, req.system, context_messages, skill,
+                prompt, req.system, context_messages, skill,
                 _rt_s.signals, _rt_s.preferred_provider, req_id,
             ))
             try:
                 async for heartbeat in _heartbeat_until_done(task):
                     yield heartbeat
-                result = task.result()
+                result = _with_brain_citations(task.result(), brain_hits)
             except Exception as exc:
                 _log.error("stream_realtime_failed req_id=%s error=%s", req_id, exc)
                 yield f"data: {json.dumps({'error': True, 'message': str(exc)[:200], 'provider': 'cloud', 'done': True})}\n\n"
@@ -1456,11 +1494,11 @@ async def query_stream_endpoint(req: QueryRequest, request: Request):
     # streaming for a routing decision that matches /query exactly. A heartbeat
     # keeps the connection alive while _resolve_query() runs.
     async def routed_stream():
-        task = asyncio.ensure_future(_resolve_query(req.query, req.system, context_messages, skill, req_id=req_id))
+        task = asyncio.ensure_future(_resolve_query(prompt, req.system, context_messages, skill, req_id=req_id))
         try:
             async for heartbeat in _heartbeat_until_done(task):
                 yield heartbeat
-            result = task.result()
+            result = _with_brain_citations(task.result(), brain_hits)
         except Exception as exc:
             _log.error("stream_resolve_failed req_id=%s error=%s", req_id, exc)
             yield f"data: {json.dumps({'error': True, 'message': str(exc)[:200], 'provider': 'ollama', 'done': True})}\n\n"
@@ -1533,19 +1571,21 @@ async def ask_stream_endpoint(req: QueryRequest, request: Request):
         """PRIVATE lane only: the mini, or a live Jetson pass if the mini is down."""
         telemetry.current_run.set(run)  # this task's own context: the mini lanes stream into run
         try:
-            skill = "personal_docs" if docs else _router.skill_router.classify(req.query)
+            skill = "personal_docs" if docs else _router.skill_router.classify(req.query, allow_brain=True)
 
             async def local_query(prompt: str, system: str, messages: list, skill: str) -> dict:
                 return await local_llm.query_streaming(prompt, system, messages, skill, run=run, label="local")
 
+            prompt, brain_hits = _brain_prompt(req.query, skill, private=True)
             with privacy.private_scope():
                 if docs:
                     result = await _docs_lane(req.query, req_id)
                 else:
                     result = await _private_with_docs(
-                        req.query, req.system, _session_context(req.session_id, req.messages), skill, req_id,
+                        prompt, req.system, _session_context(req.session_id, req.messages), skill, req_id,
                         live_data=classify_intent(req.query).is_realtime, local_query=local_query,
                     )
+            _with_brain_citations(result, brain_hits)
             run.replace(result.answer, source=result.source)
             finish(run, result.answer, _stream_metadata(result, skill, t_wall))
         except Exception as exc:
@@ -1574,8 +1614,9 @@ async def ask_stream_endpoint(req: QueryRequest, request: Request):
                 })
                 return
 
-            skill = _router.skill_router.classify(req.query)
+            skill = _router.skill_router.classify(req.query, allow_brain=await _brain_allowed(request))
             context_messages = _session_context(req.session_id, req.messages)
+            prompt, brain_hits = _brain_prompt(req.query, skill, private=False)
 
             calls = 0
 
@@ -1592,9 +1633,10 @@ async def ask_stream_endpoint(req: QueryRequest, request: Request):
             _rt_s = classify_intent(req.query)
             if _rt_s.is_realtime:
                 result = await _realtime_lane(
-                    req.query, req.system, context_messages, skill,
+                    prompt, req.system, context_messages, skill,
                     _rt_s.signals, _rt_s.preferred_provider, req_id, local_query=local_query,
                 )
+                _with_brain_citations(result, brain_hits)
                 run.replace(result.answer, source=result.source)
                 metadata = _stream_metadata(result, skill, t_wall)
                 metadata.update(realtime_intent=True, realtime_signals=_rt_s.signals)
@@ -1602,9 +1644,10 @@ async def ask_stream_endpoint(req: QueryRequest, request: Request):
                 return
 
             result = await _resolve_query(
-                req.query, req.system, context_messages, skill,
+                prompt, req.system, context_messages, skill,
                 req_id=req_id, local_query=local_query,
             )
+            _with_brain_citations(result, brain_hits)
             run.replace(result.answer, source=result.source)
             finish(run, result.answer, _stream_metadata(result, skill, t_wall))
             _cache_local_result(req.query, result, skill)

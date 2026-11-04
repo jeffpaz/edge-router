@@ -43,6 +43,8 @@ LOG_FILE = Path("/opt/pazbrain/logs/sync.log")
 LOCK_FILE = Path("/opt/pazbrain/sync.lock")
 LOGSEQ_INGEST = Path("/opt/pazbrain/logseq_ingest.py")
 LOGSEQ_TIMEOUT_S = 600
+REINDEX = Path("/opt/pazbrain/bin/reindex.py")
+REINDEX_TIMEOUT_S = 120
 
 UPDATED_BY = "grok-app"
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,80}$")  # same rule as pazbrain/store.py
@@ -260,6 +262,22 @@ def logseq_ingest() -> str:
     return (last.removeprefix("logseq_ingest: ") or "no summary") + ("" if proc.returncode == 0 else f" (exit {proc.returncode})")
 
 
+def reindex() -> str:
+    """Refresh the search index (.index/brain.db). Never fails the sync; returns a status label."""
+    if not REINDEX.exists():
+        return "absent"
+    try:
+        proc = subprocess.run([sys.executable, str(REINDEX), "--quiet"], capture_output=True, text=True,
+                              timeout=REINDEX_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return f"timeout after {REINDEX_TIMEOUT_S}s"
+    except Exception as exc:  # the sync must never fail because of the index
+        return f"failed to run ({type(exc).__name__})"
+    last = (proc.stdout.strip().splitlines() or [""])[-1]
+    label = last.removeprefix("reindex: ").split(" -> ")[0] or "no summary"
+    return label + ("" if proc.returncode == 0 else f" (exit {proc.returncode})")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="pazbrain_sync.py", description=__doc__.split("\n\n")[0])
     ap.add_argument("--dry-run", action="store_true", help="sync the mirror and print planned API calls; send no writes")
@@ -350,6 +368,8 @@ def main() -> int:
             # Every run, not only when this sync wrote: the wiki also changes through other API writers.
             summary["logseq"] = logseq_ingest()
             print(f"pazbrain_sync: logseq {summary['logseq']}", file=sys.stderr)
+            summary["reindex"] = reindex()
+            print(f"pazbrain_sync: reindex {summary['reindex']}", file=sys.stderr)
         conn.close()
         return exit_code
     except Exception as exc:  # summarise, never dump content

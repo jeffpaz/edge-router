@@ -1,11 +1,12 @@
 #!/bin/bash
-# PazBrain nightly snapshot: one self-contained git bundle of the wiki repo (all refs),
+# PazBrain nightly snapshot: one self-contained git bundle of the PazBrain repo (all refs),
 # verified before it replaces anything. Runs from cron at 21:30, 30 min before
 # ~/synology-backup.sh, which rsyncs /home/jeffpaz (and so this backup dir) to the NAS.
-# Restore: git clone /opt/pazbrain/backup/pazbrain-YYYY-MM-DD.bundle wiki
+# Restore: git clone /opt/pazbrain/backup/pazbrain-YYYY-MM-DD.bundle pazbrain-restore
+#          (the repo root is /opt/pazbrain: wiki/, raw/, index.md, log.md, AGENTS.md ...)
 set -euo pipefail
 
-WIKI=/opt/pazbrain/wiki
+WIKI=/opt/pazbrain   # repo root (the wiki is wiki/ inside it)
 DEST=/opt/pazbrain/backup
 KEEP_DAYS=14
 OUT="$DEST/pazbrain-$(date +%F).bundle"

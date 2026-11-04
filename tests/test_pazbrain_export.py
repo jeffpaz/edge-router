@@ -19,7 +19,8 @@ spec.loader.exec_module(exp)
 PRIVATE_TIER = """---
 title: AskJetson private tier
 slug: askjetson-private-tier
-category: decisions
+type: topic
+visibility: cloud
 tags: [askjetson, homelab]
 updated: 2026-10-20
 confidence: high
@@ -34,7 +35,7 @@ summary: The mini runs qwen3 and bge-m3.
 TODO = """---
 title: Homelab todo
 slug: homelab-todo
-category: projects
+type: project
 tags: []
 summary: ''
 ---
@@ -50,9 +51,10 @@ def write_wiki(root: Path, pages: dict[str, str]) -> None:
 
 
 WIKI = {
-    "decisions/askjetson-private-tier.md": PRIVATE_TIER,
+    "topics/askjetson-private-tier.md": PRIVATE_TIER,
     "projects/homelab-todo.md": TODO,
-    "inbox/no-frontmatter.md": "Just a note about the router\n",
+    "sources/no-frontmatter.md": "Just a note about the router\n",
+    "projects/askjetson/AGENTS.md": "# Room: askjetson\n",
     "index.md": "generated index",
     "log.md": "generated log",
     "_archive/old-page.md": "---\ntitle: Old\n---\nretired",
@@ -97,11 +99,11 @@ def test_same_pages_as_the_logseq_mirror(fake):
 def test_pages_render_title_meta_summary_and_full_body(fake):
     md = exp.export()[0]["AskJetson private tier.md"].decode()
     assert md == ("# AskJetson private tier\n\n"
-                  "Category: decisions · Tags: askjetson, homelab · Updated: 2026-10-20 · Confidence: high\n\n"
+                  "Type: topic · Visibility: cloud · Tags: askjetson, homelab · Updated: 2026-10-20 · Confidence: high\n\n"
                   "Summary: The mini runs qwen3 and bge-m3.\n\n"
                   "## Decision\n- Mini runs [[qwen3]] and bge-m3\n  - 8 GB is enough\n")
     todo = exp.export()[0]["Homelab todo.md"].decode()
-    assert todo == "# Homelab todo\n\nCategory: projects\n\n- Replace the UPS battery\n"   # empty fields left out
+    assert todo == "# Homelab todo\n\nType: project\n\n- Replace the UPS battery\n"   # empty fields left out
     assert exp.export()[0]["no frontmatter.md"].decode() == "# no frontmatter\n\nJust a note about the router\n"
 
 

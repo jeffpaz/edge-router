@@ -1,20 +1,22 @@
-"""PazBrain wiki store: Markdown pages in a git repo, plus a SQLite FTS5 index.
+"""PazBrain wiki store (read-only) plus the raw/inbox drop box.
 
-Layout under WIKI_DIR (one git repo, one commit per write):
-  <category>/<slug>.md   live pages — YAML frontmatter + Markdown body
-  _archive/<slug>.md     soft-deleted pages
-  index.md               generated table of contents
-  log.md                 append-only change log, one line per write
+Layout under ROOT (/opt/pazbrain, one git repo; see ROOT/AGENTS.md):
+  wiki/<folder>/<slug>.md     pages — YAML frontmatter + Markdown body, written only by the librarian
+  wiki/projects/<room>/AGENTS.md  project rooms (not pages; ignored here)
+  wiki/_archive/              retired pages (ignored)
+  index.md, log.md            maintained by the librarian; log.md feeds /recent
+  raw/inbox/                  the only place this module writes (add_to_inbox)
 
-INDEX_DB is derived data (pages, FTS5, wiki-link graph); `python -m pazbrain.reindex`
-rebuilds it from the files at any time.
+INDEX_DB is derived data (pages, FTS5, wiki-link graph). It is rebuilt automatically whenever the
+page files change (checked on every read: one stat per page), or by `python -m pazbrain.reindex`.
 
-All writes are serialised by one lock: the edge-router runs a single uvicorn worker,
-and sync route handlers run in its threadpool.
+Visibility: pages marked `visibility: local-only` are left out of every read made with
+include_local=False (routes.py passes that for requests that came through the Cloudflare Tunnel).
 """
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import os
@@ -23,30 +25,35 @@ import sqlite3
 import subprocess
 import threading
 from contextlib import closing
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 WIKI_DIR = Path(os.getenv("PAZBRAIN_WIKI_DIR", "/opt/pazbrain/wiki"))
+ROOT = Path(os.getenv("PAZBRAIN_ROOT", str(WIKI_DIR.parent)))
 INDEX_DB = Path(os.getenv("PAZBRAIN_INDEX_DB", "/opt/pazbrain/index.db"))
+INBOX_DIR = ROOT / "raw" / "inbox"
+LOG_MD = ROOT / "log.md"
 
-CATEGORIES = ("people", "projects", "areas", "topics", "decisions", "journal", "inbox")
-CONFIDENCE = ("stated", "inferred")
-SOURCE_TYPES = ("email", "file", "chat")
+# type -> folder under wiki/
+FOLDERS = {"person": "people", "project": "projects", "area": "areas", "topic": "topics",
+           "source": "sources", "concept": "concepts"}
+TYPES = tuple(FOLDERS)
+VISIBILITY = ("cloud", "local-only")
 ARCHIVE = "_archive"
-MAX_PAGE_BYTES = 100 * 1024
+MAX_INBOX_BYTES = 200 * 1024
+SCHEMA_VERSION = 2
 
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,80}$")
-TAG_RE = re.compile(r"^[a-z0-9][a-z0-9_./-]{0,49}$")
-AUTHOR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$")
 _LINK_RE = re.compile(r"\[\[([^\[\]|\n]+?)(?:\|[^\[\]\n]*)?\]\]")
-_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
-_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+_LOG_RE = re.compile(r"^## \[(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})\] (.+?) \| (.+?) \| (.*)$")
+# The Jetson's clock and log.md are Phoenix time (no DST).
+_LOG_TZ = "-07:00"
 
 _lock = threading.RLock()
-_ready = False
+_signature: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -75,14 +82,6 @@ class TooLarge(StoreError):
     status, kind = 413, "too_large"
 
 
-class Conflict(StoreError):
-    status, kind = 409, "conflict"
-
-    def __init__(self, detail: str, current: dict[str, Any]) -> None:
-        super().__init__(detail)
-        self.current = current
-
-
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
@@ -90,18 +89,6 @@ class Conflict(StoreError):
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-
-def _next_updated(prev: str | None) -> str:
-    """A fresh `updated` stamp, strictly later than prev so base_updated checks can't collide."""
-    stamp = now_iso()
-    if prev and stamp <= prev:
-        try:
-            bumped = datetime.fromisoformat(prev.replace("Z", "+00:00")) + timedelta(milliseconds=1)
-            stamp = bumped.isoformat(timespec="milliseconds").replace("+00:00", "Z")
-        except ValueError:
-            pass
-    return stamp
 
 
 def slugify(text: str) -> str:
@@ -115,48 +102,8 @@ def check_slug(slug: str) -> str:
     return slug
 
 
-def _inside_wiki(path: Path) -> Path:
-    resolved = path.resolve()
-    if resolved != WIKI_DIR.resolve() and WIKI_DIR.resolve() not in resolved.parents:
-        raise InvalidInput("path escapes the wiki")
-    return resolved
-
-
 def _one_line(text: str, limit: int) -> str:
     return " ".join(str(text).split())[:limit]
-
-
-def _norm_tags(tags: list[str]) -> list[str]:
-    out: list[str] = []
-    for raw in tags or []:
-        tag = re.sub(r"\s+", "-", str(raw).strip().lower())
-        if not TAG_RE.fullmatch(tag):
-            raise InvalidInput(f"invalid tag {tag[:60]!r}")
-        if tag not in out:
-            out.append(tag)
-    if len(out) > 50:
-        raise InvalidInput("at most 50 tags")
-    return out
-
-
-def _norm_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-    for src in sources or []:
-        stype = str(src.get("type", ""))
-        ref = _one_line(src.get("ref", ""), 500)
-        if stype not in SOURCE_TYPES or not ref:
-            raise InvalidInput("each source needs type (email|file|chat) and ref")
-        if (stype, ref) in seen:
-            continue
-        seen.add((stype, ref))
-        item: dict[str, Any] = {"type": stype, "ref": ref}
-        if src.get("date"):
-            item["date"] = _one_line(src["date"], 40)
-        out.append(item)
-    if len(out) > 200:
-        raise InvalidInput("at most 200 sources")
-    return out
 
 
 def _plain(value: Any) -> Any:
@@ -174,9 +121,9 @@ def _plain(value: Any) -> Any:
     return value
 
 
-def extract_links(body: str, own_slug: str = "") -> list[str]:
+def extract_links(text: str, own_slug: str = "") -> list[str]:
     links: list[str] = []
-    for m in _LINK_RE.finditer(body or ""):
+    for m in _LINK_RE.finditer(text or ""):
         target = slugify(m.group(1))
         if SLUG_RE.fullmatch(target) and target != own_slug and target not in links:
             links.append(target)
@@ -186,11 +133,6 @@ def extract_links(body: str, own_slug: str = "") -> list[str]:
 # ---------------------------------------------------------------------------
 # Page files
 # ---------------------------------------------------------------------------
-
-
-def _serialize(fm: dict[str, Any], body: str) -> str:
-    dumped = yaml.safe_dump(fm, sort_keys=False, allow_unicode=True, width=1000)
-    return f"---\n{dumped}---\n\n{body.strip()}\n"
 
 
 def _parse(text: str) -> tuple[dict[str, Any], str]:
@@ -205,59 +147,60 @@ def _parse(text: str) -> tuple[dict[str, Any], str]:
     return fm, text[end + 5 :].lstrip("\n")
 
 
+def _page_files() -> list[Path]:
+    """Every page file: wiki/<folder>/<slug>.md for the six type folders (rooms and _archive excluded)."""
+    files = []
+    for folder in FOLDERS.values():
+        files += sorted((WIKI_DIR / folder).glob("*.md"))
+    return [p for p in files if SLUG_RE.fullmatch(p.stem)]
+
+
 def _find(slug: str) -> Path | None:
-    for cat in CATEGORIES:
-        path = WIKI_DIR / cat / f"{slug}.md"
+    for folder in FOLDERS.values():
+        path = WIKI_DIR / folder / f"{slug}.md"
         if path.is_file():
             return path
     return None
 
 
 def _read(path: Path) -> tuple[dict[str, Any], str]:
-    return _parse(path.read_text(encoding="utf-8"))
+    fm, body = _parse(path.read_text(encoding="utf-8"))
+    fm["slug"] = path.stem
+    fm["category"] = path.parent.name  # folder; kept for older API clients
+    fm.setdefault("type", next((t for t, f in FOLDERS.items() if f == path.parent.name), ""))
+    if fm.get("visibility") not in VISIBILITY:
+        fm["visibility"] = "local-only"  # unknown or missing: fail closed
+    return fm, body
 
 
-# ---------------------------------------------------------------------------
-# git
-# ---------------------------------------------------------------------------
+def _related(fm: dict[str, Any]) -> list[str]:
+    return extract_links(" ".join(str(r) for r in fm.get("related") or []))
 
 
 def _git(*args: str) -> str:
-    proc = subprocess.run(
-        ["git", "-C", str(WIKI_DIR), *args],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    proc = subprocess.run(["git", "-C", str(WIKI_DIR), *args], capture_output=True, text=True, timeout=30)
     if proc.returncode != 0:
         raise RuntimeError(f"git {args[0]} failed: {proc.stderr.strip()[:500]}")
     return proc.stdout
 
 
-def _commit(message: str, author: str) -> str:
-    _git("add", "-A")
-    _git(
-        "-c", f"user.name={author}",
-        "-c", f"user.email={author.lower()}@pazbrain.local",
-        "commit", "-q", "-m", message,
-    )
-    return _git("rev-parse", "HEAD").strip()
-
-
 # ---------------------------------------------------------------------------
-# Index DB
+# Index DB (derived; rebuilt when the page files change)
 # ---------------------------------------------------------------------------
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS pages (
-    slug TEXT PRIMARY KEY, title TEXT, category TEXT, tags TEXT,
-    summary TEXT, updated TEXT, updated_by TEXT, confidence TEXT
+DROP TABLE IF EXISTS pages;
+DROP TABLE IF EXISTS pages_fts;
+DROP TABLE IF EXISTS links;
+CREATE TABLE pages (
+    slug TEXT PRIMARY KEY, title TEXT, type TEXT, category TEXT, visibility TEXT, tags TEXT,
+    summary TEXT, created TEXT, updated TEXT, confidence TEXT
 );
-CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(
+CREATE VIRTUAL TABLE pages_fts USING fts5(
     slug UNINDEXED, title, summary, tags, body, tokenize = 'porter unicode61'
 );
-CREATE TABLE IF NOT EXISTS links (src TEXT NOT NULL, dst TEXT NOT NULL, PRIMARY KEY (src, dst));
-CREATE INDEX IF NOT EXISTS links_dst ON links (dst);
+CREATE TABLE links (src TEXT NOT NULL, dst TEXT NOT NULL, PRIMARY KEY (src, dst));
+CREATE INDEX links_dst ON links (dst);
 """
 
 
@@ -267,100 +210,67 @@ def _db() -> sqlite3.Connection:
     return conn
 
 
-def _unindex(conn: sqlite3.Connection, slug: str) -> None:
-    conn.execute("DELETE FROM pages WHERE slug = ?", (slug,))
-    conn.execute("DELETE FROM pages_fts WHERE slug = ?", (slug,))
-    conn.execute("DELETE FROM links WHERE src = ?", (slug,))
-
-
-def _index(conn: sqlite3.Connection, fm: dict[str, Any], body: str) -> None:
-    slug = fm["slug"]
-    _unindex(conn, slug)
-    tags = fm.get("tags") or []
-    conn.execute(
-        "INSERT INTO pages VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (slug, fm.get("title", ""), fm.get("category", ""), json.dumps(tags),
-         fm.get("summary", ""), fm.get("updated", ""), fm.get("updated_by", ""),
-         fm.get("confidence", "")),
-    )
-    conn.execute(
-        "INSERT INTO pages_fts (slug, title, summary, tags, body) VALUES (?, ?, ?, ?, ?)",
-        (slug, fm.get("title", ""), fm.get("summary", ""), " ".join(tags), body),
-    )
-    conn.executemany(
-        "INSERT OR IGNORE INTO links (src, dst) VALUES (?, ?)",
-        [(slug, dst) for dst in extract_links(body, slug)],
-    )
-
-
-def _write_index_md(conn: sqlite3.Connection) -> None:
-    lines = ["# PazBrain index", "", "_Generated on every write. Do not edit by hand._", ""]
-    for cat in CATEGORIES:
-        rows = conn.execute(
-            "SELECT slug, title, summary FROM pages WHERE category = ? ORDER BY lower(title)", (cat,)
-        ).fetchall()
-        lines += [f"## {cat.capitalize()} ({len(rows)})", ""]
-        lines += [f"- [[{r['slug']}|{r['title']}]] — {r['summary']}" for r in rows] or ["_none_"]
-        lines.append("")
-    (WIKI_DIR / "index.md").write_text("\n".join(lines), encoding="utf-8")
-
-
-def _append_log(action: str, slug: str, updated_by: str, summary: str) -> None:
-    line = f"- {now_iso()} | {updated_by} | {action} | {slug} | {_one_line(summary, 300).replace('|', '/')}\n"
-    with open(WIKI_DIR / "log.md", "a", encoding="utf-8") as fh:
-        fh.write(line)
-
-
-# ---------------------------------------------------------------------------
-# Setup
-# ---------------------------------------------------------------------------
-
-
-def init_repo() -> None:
-    """Create the wiki repo and index schema if missing. Idempotent."""
-    global _ready
-    with _lock:
-        WIKI_DIR.mkdir(parents=True, exist_ok=True)
-        for sub in (*CATEGORIES, ARCHIVE):
-            (WIKI_DIR / sub).mkdir(exist_ok=True)
-            keep = WIKI_DIR / sub / ".gitkeep"
-            if not keep.exists():
-                keep.touch()
-        with closing(_db()) as conn, conn:
-            conn.executescript(_SCHEMA)
-        if not (WIKI_DIR / ".git").exists():
-            _git("init", "-q", "-b", "main")
-            (WIKI_DIR / "log.md").write_text("# PazBrain change log\n\n", encoding="utf-8")
-            with closing(_db()) as conn, conn:
-                _write_index_md(conn)
-            _commit("[system] init wiki", "system")
-        _ready = True
-
-
-def ensure_ready() -> None:
-    if not _ready:
-        init_repo()
+def _files_signature() -> str:
+    h = hashlib.sha256()
+    for p in _page_files():
+        st = p.stat()
+        h.update(f"{p.relative_to(WIKI_DIR)}\0{st.st_mtime_ns}\0{st.st_size}\n".encode())
+    return h.hexdigest()
 
 
 def rebuild_index() -> int:
-    """Rebuild INDEX_DB from the page files; commit index.md if it changed. Returns page count."""
+    """Rebuild INDEX_DB from the page files. Returns the page count. Unreadable pages are skipped."""
+    global _signature
     with _lock:
-        ensure_ready()
+        sig = _files_signature()
         count = 0
         with closing(_db()) as conn, conn:
-            conn.execute("DELETE FROM pages")
-            conn.execute("DELETE FROM pages_fts")
-            conn.execute("DELETE FROM links")
-            for cat in CATEGORIES:
-                for path in sorted((WIKI_DIR / cat).glob("*.md")):
+            conn.executescript(_SCHEMA)
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            for path in _page_files():
+                try:
                     fm, body = _read(path)
-                    fm["slug"], fm["category"] = path.stem, cat
-                    _index(conn, fm, body)
-                    count += 1
-            _write_index_md(conn)
-        if _git("status", "--porcelain").strip():
-            _commit("[system] reindex", "system")
+                except (ValueError, yaml.YAMLError, OSError):
+                    continue
+                tags = [str(t) for t in fm.get("tags") or []]
+                conn.execute(
+                    "INSERT OR REPLACE INTO pages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (fm["slug"], str(fm.get("title", "")), fm["type"], fm["category"], fm["visibility"],
+                     json.dumps(tags), str(fm.get("summary", "")), str(fm.get("created", "")),
+                     str(fm.get("updated", "")), str(fm.get("confidence", ""))),
+                )
+                conn.execute(
+                    "INSERT INTO pages_fts (slug, title, summary, tags, body) VALUES (?, ?, ?, ?, ?)",
+                    (fm["slug"], str(fm.get("title", "")), str(fm.get("summary", "")), " ".join(tags), body),
+                )
+                dsts = extract_links(body, fm["slug"])
+                dsts += [d for d in _related(fm) if d not in dsts and d != fm["slug"]]
+                conn.executemany("INSERT OR IGNORE INTO links (src, dst) VALUES (?, ?)",
+                                 [(fm["slug"], d) for d in dsts])
+                count += 1
+        _signature = sig
         return count
+
+
+def ensure_ready() -> None:
+    """Raise if the wiki is missing; rebuild the index if the page files changed since the last build."""
+    if not WIKI_DIR.is_dir():
+        raise RuntimeError(f"no wiki at {WIKI_DIR}")
+    with _lock:
+        if _signature is None:
+            with closing(_db()) as conn:
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version != SCHEMA_VERSION:
+                rebuild_index()
+                return
+        if _files_signature() != _signature:
+            rebuild_index()
+
+
+def _hidden(conn: sqlite3.Connection, include_local: bool) -> set[str]:
+    if include_local:
+        return set()
+    return {r["slug"] for r in conn.execute("SELECT slug FROM pages WHERE visibility != 'cloud'")}
 
 
 # ---------------------------------------------------------------------------
@@ -368,50 +278,51 @@ def rebuild_index() -> int:
 # ---------------------------------------------------------------------------
 
 
-def _page_dict(fm: dict[str, Any], body: str) -> dict[str, Any]:
-    page = {k: fm.get(k) for k in (
-        "title", "slug", "category", "tags", "sources", "created", "updated",
-        "updated_by", "confidence", "summary",
-    )}
-    page["tags"] = page["tags"] or []
-    page["sources"] = page["sources"] or []
-    page["body"] = body
-    return page
-
-
-def get_page(slug: str) -> dict[str, Any]:
+def get_page(slug: str, include_local: bool = False) -> dict[str, Any]:
     check_slug(slug)
     ensure_ready()
     path = _find(slug)
     if path is None:
         raise NotFound(f"no page {slug!r}")
     fm, body = _read(path)
-    page = _page_dict(fm, body)
+    if fm["visibility"] != "cloud" and not include_local:
+        raise NotFound(f"no page {slug!r}")  # same answer as a missing page: reveal nothing
+    page = {k: fm.get(k) for k in (
+        "title", "slug", "type", "category", "visibility", "summary", "created", "updated", "confidence",
+    )}
+    page["tags"] = [str(t) for t in fm.get("tags") or []]
+    page["sources"] = [str(s) for s in fm.get("sources") or []]
+    page["related"] = _related(fm)
+    page["updated_by"] = None  # not tracked in frontmatter any more; see /history
+    page["body"] = body
     with closing(_db()) as conn:
+        hidden = _hidden(conn, include_local)
         rows = conn.execute(
             "SELECT l.src AS slug, p.title FROM links l JOIN pages p ON p.slug = l.src "
-            "WHERE l.dst = ? ORDER BY lower(p.title)",
-            (slug,),
+            "WHERE l.dst = ? ORDER BY lower(p.title)", (slug,),
         ).fetchall()
-        page["backlinks"] = [dict(r) for r in rows]
-        # Which outgoing [[links]] point at pages that exist, so the UI can mark the rest red.
+        page["backlinks"] = [dict(r) for r in rows if r["slug"] not in hidden]
+        # Which outgoing [[links]] point at pages this caller can see, so the UI can mark the rest red.
         out = extract_links(body, slug)
         existing = {
             r["slug"] for r in conn.execute(
                 f"SELECT slug FROM pages WHERE slug IN ({','.join('?' * len(out))})", out
             )
-        } if out else set()
+        } - hidden if out else set()
         page["links"] = [{"slug": s, "exists": s in existing} for s in out]
     return page
 
 
-def list_pages(category: str | None = None, tag: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+def list_pages(type_: str | None = None, tag: str | None = None, limit: int = 100,
+               include_local: bool = False) -> list[dict[str, Any]]:
     ensure_ready()
-    sql = "SELECT slug, title, category, summary, updated, tags FROM pages WHERE 1=1"
+    sql = "SELECT slug, title, type, category, visibility, summary, updated, tags FROM pages WHERE 1=1"
     args: list[Any] = []
-    if category:
-        sql += " AND category = ?"
-        args.append(category)
+    if not include_local:
+        sql += " AND visibility = 'cloud'"
+    if type_:
+        sql += " AND type = ?"
+        args.append(type_)
     if tag:
         sql += " AND EXISTS (SELECT 1 FROM json_each(pages.tags) WHERE value = ?)"
         args.append(tag.strip().lower())
@@ -421,7 +332,7 @@ def list_pages(category: str | None = None, tag: str | None = None, limit: int =
         return [{**dict(r), "tags": json.loads(r["tags"] or "[]")} for r in conn.execute(sql, args)]
 
 
-def search(q: str, limit: int = 20) -> list[dict[str, Any]]:
+def search(q: str, limit: int = 20, include_local: bool = False) -> list[dict[str, Any]]:
     ensure_ready()
     terms = re.findall(r"\w+", q or "", flags=re.UNICODE)[:12]
     if not terms:
@@ -429,10 +340,11 @@ def search(q: str, limit: int = 20) -> list[dict[str, Any]]:
     # Quote every term so user input can never be parsed as FTS5 syntax; prefix-match the last.
     expr = " ".join(f'"{t}"' for t in terms[:-1]) + f' "{terms[-1]}"*'
     sql = (
-        "SELECT p.slug, p.title, p.category, p.summary, p.updated, "
+        "SELECT p.slug, p.title, p.type, p.category, p.visibility, p.summary, p.updated, "
         "snippet(pages_fts, -1, char(2), char(3), '…', 16) AS snippet "
         "FROM pages_fts JOIN pages p ON p.slug = pages_fts.slug "
-        "WHERE pages_fts MATCH ? ORDER BY bm25(pages_fts, 0.0, 10.0, 5.0, 3.0, 1.0) LIMIT ?"
+        "WHERE pages_fts MATCH ?" + ("" if include_local else " AND p.visibility = 'cloud'") +
+        " ORDER BY bm25(pages_fts, 0.0, 10.0, 5.0, 3.0, 1.0) LIMIT ?"
     )
     with closing(_db()) as conn:
         rows = conn.execute(sql, (expr.strip(), limit)).fetchall()
@@ -445,9 +357,13 @@ def search(q: str, limit: int = 20) -> list[dict[str, Any]]:
     return out
 
 
-def history(slug: str, limit: int = 50) -> list[dict[str, Any]]:
+def history(slug: str, limit: int = 50, include_local: bool = False) -> list[dict[str, Any]]:
     check_slug(slug)
     ensure_ready()
+    path = _find(slug)
+    if path is not None and not include_local and _read(path)[0]["visibility"] != "cloud":
+        raise NotFound(f"no page {slug!r}")
+    # Paths are relative to wiki/; history from before the move (decisions/, journal/) still matches.
     out = _git(
         "log", f"-n{limit}", "--format=%H%x1f%an%x1f%aI%x1f%s", "--",
         f":(glob)*/{slug}.md", f":(glob){ARCHIVE}/{slug}.*.md",
@@ -456,231 +372,61 @@ def history(slug: str, limit: int = 50) -> list[dict[str, Any]]:
     for line in out.splitlines():
         commit, author, when, subject = line.split("\x1f", 3)
         entries.append({"commit": commit, "author": author, "date": when, "message": subject})
-    if not entries and _find(slug) is None:
+    if not entries and path is None:
         raise NotFound(f"no page {slug!r}")
     return entries
 
 
-def recent(limit: int = 50) -> list[dict[str, Any]]:
+def recent(limit: int = 50, include_local: bool = False) -> list[dict[str, Any]]:
+    """Entries from ROOT/log.md (`## [YYYY-MM-DD HH:MM] op | agent | summary`), newest first.
+    slug is the first [[link]] in the summary, or ""."""
     ensure_ready()
-    lines = (WIKI_DIR / "log.md").read_text(encoding="utf-8").splitlines()
+    try:
+        lines = LOG_MD.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    with closing(_db()) as conn:
+        hidden = _hidden(conn, include_local)
     out = []
     for line in reversed(lines):
-        if not line.startswith("- "):
+        m = _LOG_RE.match(line)
+        if not m:
             continue
-        parts = line[2:].split(" | ", 4)
-        if len(parts) != 5:
+        day, hm, action, by, summary = m.groups()
+        links = extract_links(summary)
+        if hidden & set(links):
             continue
-        when, by, action, slug, summary = parts
-        out.append({"date": when, "updated_by": by, "action": action, "slug": slug, "summary": summary})
+        out.append({"date": f"{day}T{hm}:00{_LOG_TZ}", "updated_by": by.strip(), "action": action.strip(),
+                    "slug": links[0] if links else "", "summary": summary.strip()})
         if len(out) >= limit:
             break
     return out
 
 
 # ---------------------------------------------------------------------------
-# Writes
+# The one write: drop material into raw/inbox for the librarian
 # ---------------------------------------------------------------------------
 
 
-def _transaction(apply, message: str, author: str) -> str:
-    """Run apply() (file + index changes), then commit. On any failure restore the
-    working tree to HEAD and rebuild the index so files, index and git stay in step."""
-    try:
-        apply()
-        return _commit(message, author)
-    except Exception:
-        try:
-            _git("reset", "-q", "--hard", "HEAD")
-            _git("clean", "-qfd")
-        finally:
-            rebuild_index()
-        raise
-
-
-def _check_base(fm: dict[str, Any], base_updated: str | None, body: str) -> None:
-    if base_updated != fm.get("updated"):
-        raise Conflict(
-            "base_updated does not match the page's current updated; re-read and retry",
-            _page_dict(fm, body),
-        )
-
-
-def _check_author(updated_by: str) -> str:
-    if not AUTHOR_RE.fullmatch(updated_by or ""):
-        raise InvalidInput("updated_by must match ^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$")
-    return updated_by
-
-
-def _save(slug: str, fm: dict[str, Any], body: str, old_path: Path | None, action: str) -> dict[str, Any]:
-    text = _serialize(fm, body)
-    if len(text.encode("utf-8")) > MAX_PAGE_BYTES:
-        raise TooLarge(f"page exceeds {MAX_PAGE_BYTES} bytes")
-    new_path = _inside_wiki(WIKI_DIR / fm["category"] / f"{slug}.md")
-
-    def apply() -> None:
-        if old_path is not None and old_path.resolve() != new_path:
-            old_path.unlink()
-        new_path.write_text(text, encoding="utf-8")
-        _append_log(action, slug, fm["updated_by"], fm["summary"])
-        with closing(_db()) as conn, conn:
-            _index(conn, fm, body.strip() + "\n")
-            _write_index_md(conn)
-
-    commit = _transaction(
-        apply, f"[{fm['updated_by']}] {action} {slug}: {_one_line(fm['summary'], 200)}", fm["updated_by"]
-    )
-    return {"action": action, "commit": commit, "page": get_page(slug)}
-
-
-def put_page(
-    slug: str,
-    *,
-    title: str,
-    category: str,
-    tags: list[str],
-    sources: list[dict[str, Any]],
-    confidence: str,
-    summary: str,
-    body: str,
-    updated_by: str,
-    base_updated: str | None,
-) -> dict[str, Any]:
-    check_slug(slug)
-    _check_author(updated_by)
-    if category not in CATEGORIES:
-        raise InvalidInput(f"category must be one of {', '.join(CATEGORIES)}")
-    if confidence not in CONFIDENCE:
-        raise InvalidInput("confidence must be stated or inferred")
+def add_to_inbox(*, title: str, content: str, source_agent: str) -> dict[str, Any]:
+    """Write raw/inbox/YYYY-MM-DD-HHMMSS-<slug>.md. Never touches wiki/. Returns the relative path."""
     title = _one_line(title, 200)
     if not title:
         raise InvalidInput("title is required")
-
+    if not content.strip():
+        raise InvalidInput("content is required")
+    received = datetime.now().astimezone()
+    meta = {"title": title, "source_agent": source_agent, "received": received.isoformat(timespec="seconds")}
+    text = "---\n" + yaml.safe_dump(meta, sort_keys=False, allow_unicode=True, width=1000) + "---\n\n" + content.strip() + "\n"
+    if len(text.encode("utf-8")) > MAX_INBOX_BYTES:
+        raise TooLarge(f"inbox item exceeds {MAX_INBOX_BYTES} bytes")
+    base = f"{received:%Y-%m-%d-%H%M%S}-{slugify(title)[:60] or 'item'}"
     with _lock:
-        ensure_ready()
-        old_path = _find(slug)
-        old_fm: dict[str, Any] | None = None
-        if old_path is not None:
-            old_fm, old_body = _read(old_path)
-            _check_base(old_fm, base_updated, old_body)
-        fm = {
-            "title": title,
-            "slug": slug,
-            "category": category,
-            "tags": _norm_tags(tags),
-            "sources": _norm_sources(sources),
-            "created": (old_fm or {}).get("created") or now_iso(),
-            "updated": _next_updated((old_fm or {}).get("updated")),
-            "updated_by": updated_by,
-            "confidence": confidence,
-            "summary": _one_line(summary, 300),
-        }
-        return _save(slug, fm, body or "", old_path, "update" if old_path else "create")
-
-
-def _section_bounds(lines: list[str], heading: str) -> tuple[int, int] | None:
-    want = heading.strip().lstrip("#").strip().casefold()
-    in_fence = False
-    start = level = None
-    for i, line in enumerate(lines):
-        if _FENCE_RE.match(line):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
-        m = _HEADING_RE.match(line)
-        if not m:
-            continue
-        if start is not None and len(m.group(1)) <= level:
-            return start, i
-        if start is None and m.group(2).casefold() == want:
-            start, level = i, len(m.group(1))
-    return (start, len(lines)) if start is not None else None
-
-
-def _apply_section(body: str, heading: str, content: str, replace: bool) -> str:
-    heading = heading.strip()
-    if not heading or "\n" in heading or len(heading) > 200:
-        raise InvalidInput("heading must be one line, 1-200 characters")
-    content = content.strip("\n")
-    lines = body.rstrip("\n").split("\n") if body.strip() else []
-    bounds = _section_bounds(lines, heading)
-    if bounds is None:
-        new = "\n".join(lines).rstrip()
-        return (new + "\n\n" if new else "") + f"## {heading.lstrip('#').strip()}\n\n{content}\n"
-    start, end = bounds
-    if replace:
-        section = ["", *content.split("\n"), ""]
-    else:
-        section = lines[start + 1 : end]
-        while section and not section[-1].strip():
-            section.pop()
-        section += ["", *content.split("\n"), ""]
-    if end == len(lines):
-        while section and not section[-1].strip():
-            section.pop()
-    return "\n".join(lines[: start + 1] + section + lines[end:]).rstrip("\n") + "\n"
-
-
-def patch_page(
-    slug: str,
-    *,
-    ops: list[dict[str, Any]],
-    updated_by: str,
-    base_updated: str | None,
-    summary: str | None = None,
-) -> dict[str, Any]:
-    check_slug(slug)
-    _check_author(updated_by)
-    if not ops:
-        raise InvalidInput("ops must not be empty")
-
-    with _lock:
-        ensure_ready()
-        path = _find(slug)
-        if path is None:
-            raise NotFound(f"no page {slug!r}")
-        fm, body = _read(path)
-        _check_base(fm, base_updated, body)
-        for op in ops:
-            kind = op.get("op")
-            if kind in ("append_section", "replace_section"):
-                body = _apply_section(body, op.get("heading", ""), op.get("content", ""), kind == "replace_section")
-            elif kind == "add_tags":
-                fm["tags"] = _norm_tags([*(fm.get("tags") or []), *op.get("tags", [])])
-            elif kind == "add_sources":
-                fm["sources"] = _norm_sources([*(fm.get("sources") or []), *op.get("sources", [])])
-            else:
-                raise InvalidInput(f"unknown op {str(kind)[:40]!r}")
-        fm["updated"] = _next_updated(fm.get("updated"))
-        fm["updated_by"] = updated_by
-        if summary is not None:
-            fm["summary"] = _one_line(summary, 300)
-        fm["slug"], fm["category"] = slug, path.parent.name
-        return _save(slug, fm, body, path, "patch")
-
-
-def archive_page(slug: str, *, updated_by: str) -> dict[str, Any]:
-    check_slug(slug)
-    _check_author(updated_by)
-    with _lock:
-        ensure_ready()
-        path = _find(slug)
-        if path is None:
-            raise NotFound(f"no page {slug!r}")
-        fm, _ = _read(path)
-        dest = WIKI_DIR / ARCHIVE / f"{slug}.md"
-        if dest.exists():
-            dest = WIKI_DIR / ARCHIVE / f"{slug}.{now_iso().replace(':', '').replace('.', '')}.md"
-        dest = _inside_wiki(dest)
-        summary = fm.get("summary") or fm.get("title") or slug
-
-        def apply() -> None:
-            os.replace(path, dest)
-            _append_log("archive", slug, updated_by, summary)
-            with closing(_db()) as conn, conn:
-                _unindex(conn, slug)
-                _write_index_md(conn)
-
-        commit = _transaction(apply, f"[{updated_by}] archive {slug}: {_one_line(summary, 200)}", updated_by)
-        return {"action": "archive", "commit": commit, "archived_to": str(dest.relative_to(WIKI_DIR.resolve()))}
+        INBOX_DIR.mkdir(parents=True, exist_ok=True)
+        path, n = INBOX_DIR / f"{base}.md", 2
+        while path.exists():
+            path, n = INBOX_DIR / f"{base}-{n}.md", n + 1
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    return {"path": str(path.relative_to(ROOT)), "received": meta["received"]}

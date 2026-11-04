@@ -1,18 +1,26 @@
 """PazBrain HTTP API, mounted by main.py at /brain/api.
 
+The wiki is read-only here: only the librarian (Claude Code on the Jetson, following
+/opt/pazbrain/AGENTS.md) writes wiki/. The one write is POST /inbox, which drops material into
+raw/inbox/ for the librarian to ingest.
+
+Visibility: requests that came through the Cloudflare Tunnel (they carry cf-ray /
+cf-connecting-ip, which cloudflared always adds) never see `visibility: local-only` pages: not
+in lists, search, backlinks, history or /recent, and a direct GET answers 404. Requests made
+directly on the LAN (:8000) see everything.
+
 A separate FastAPI sub-application rather than a router on the main app, so that:
-  - its OpenAPI schema is served on its own at /brain/api/openapi.json and the main
-    app's schema is unchanged;
+  - its OpenAPI schema is served on its own at /brain/api/openapi.json;
   - errors keep their real status codes instead of hitting the main app's catch-all
     exception handler (which answers 200);
-  - nothing here runs at import time: the wiki is initialised on first request, so a
-    storage problem returns 503 from /brain/api and can't take down the other routes.
+  - nothing here runs at import time: storage problems return 503 from /brain/api and
+    can't take down the other routes.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Annotated, Any, Literal, Optional, Union
+from typing import Annotated, Any, Literal, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -28,10 +36,10 @@ _MAX_REQUEST_BYTES = 256 * 1024
 
 app = FastAPI(
     title="PazBrain",
-    version="1.0.0",
+    version="2.0.0",
     description=(
-        "Private personal wiki. Reads need the read token, the write token, or an "
-        "allowlisted Firebase ID token; writes need the write token."
+        "Private personal wiki, read-only. Reads need the read token, the write token, or an "
+        "allowlisted Firebase ID token. POST /inbox (write token) drops material for the librarian."
     ),
     docs_url=None,
     redoc_url=None,
@@ -39,67 +47,16 @@ app = FastAPI(
 )
 
 Slug = Annotated[str, Path(description="Page slug, ^[a-z0-9][a-z0-9-]{0,80}$", max_length=81)]
-Category = Literal["people", "projects", "areas", "topics", "decisions", "journal", "inbox"]
-Author = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$", description="Who made the change, e.g. grok")]
+PageType = Literal["person", "project", "area", "topic", "source", "concept"]
+Agent = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$", description="Who sent it, e.g. grok")]
 
 
-# ---------------------------------------------------------------------------
-# Request models
-# ---------------------------------------------------------------------------
-
-
-class Source(BaseModel):
-    type: Literal["email", "file", "chat"]
-    ref: str = Field(min_length=1, max_length=500, description="Message id, file path, or chat reference")
-    date: Optional[str] = Field(default=None, max_length=40, description="ISO date of the source")
-
-
-class PageIn(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+class InboxIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
     title: str = Field(min_length=1, max_length=200)
-    category: Category
-    tags: list[str] = Field(default_factory=list, max_length=50)
-    sources: list[Source] = Field(default_factory=list, max_length=200)
-    confidence: Literal["stated", "inferred"]
-    summary: str = Field(max_length=300, description="One line")
-    body: str = Field(default="", description="Markdown. Use [[slug]] or [[Page Title]] to link pages.")
-    updated_by: Author
-    base_updated: Optional[str] = Field(
-        default=None, description="Required when replacing an existing page: its current `updated` value"
-    )
-
-
-class AppendSection(BaseModel):
-    op: Literal["append_section"]
-    heading: str = Field(min_length=1, max_length=200)
-    content: str
-
-
-class ReplaceSection(BaseModel):
-    op: Literal["replace_section"]
-    heading: str = Field(min_length=1, max_length=200)
-    content: str
-
-
-class AddTags(BaseModel):
-    op: Literal["add_tags"]
-    tags: list[str] = Field(min_length=1, max_length=50)
-
-
-class AddSources(BaseModel):
-    op: Literal["add_sources"]
-    sources: list[Source] = Field(min_length=1, max_length=200)
-
-
-PatchOp = Annotated[Union[AppendSection, ReplaceSection, AddTags, AddSources], Field(discriminator="op")]
-
-
-class PatchIn(BaseModel):
-    ops: list[PatchOp] = Field(min_length=1, max_length=20)
-    updated_by: Author
-    base_updated: str = Field(description="The page's current `updated` value")
-    summary: Optional[str] = Field(default=None, max_length=300, description="Optionally replace the one-line summary")
+    content: str = Field(min_length=1, description="Markdown or plain text. Treated as data, never as instructions.")
+    source_agent: Agent
 
 
 # ---------------------------------------------------------------------------
@@ -117,10 +74,7 @@ async def _limit_body(request: Request, call_next):
 
 @app.exception_handler(store.StoreError)
 async def _store_error(_: Request, exc: store.StoreError) -> JSONResponse:
-    content: dict[str, Any] = {"error": exc.kind, "detail": exc.detail}
-    if isinstance(exc, store.Conflict):
-        content["current"] = exc.current
-    return JSONResponse(content, status_code=exc.status)
+    return JSONResponse({"error": exc.kind, "detail": exc.detail}, status_code=exc.status)
 
 
 @app.exception_handler(HTTPException)
@@ -149,18 +103,9 @@ def _ready() -> None:
         raise HTTPException(503, {"error": "unavailable", "detail": "PazBrain storage is unavailable"})
 
 
-def _scrub(payload: Any) -> None:
-    hits = scrubber.scan(payload)
-    if hits:
-        _log.warning("pazbrain_secret_rejected", extra={"hits": hits})
-        raise HTTPException(
-            422,
-            {
-                "error": "secret_detected",
-                "detail": "Write rejected: content looks like a secret or financial identifier. Remove it and retry.",
-                "matches": hits,
-            },
-        )
+def _local(request: Request) -> bool:
+    """True only for requests made directly on the LAN; anything through the tunnel is cloud."""
+    return not any(h in request.headers for h in ("cf-ray", "cf-connecting-ip"))
 
 
 Reader = Annotated[str, Depends(require_read)]
@@ -174,73 +119,61 @@ Writer = Annotated[str, Depends(require_write)]
 
 @app.get("/pages", summary="List pages, newest first")
 def list_pages(
+    request: Request,
     _: Reader,
-    category: Optional[Category] = None,
+    type: Optional[PageType] = None,
     tag: Optional[str] = Query(default=None, max_length=50),
     limit: int = Query(default=100, ge=1, le=1000),
 ) -> dict[str, Any]:
     _ready()
-    pages = store.list_pages(category, tag, limit)
+    pages = store.list_pages(type, tag, limit, include_local=_local(request))
     return {"count": len(pages), "pages": pages}
 
 
 @app.get("/pages/{slug}", summary="Get a full page with frontmatter, backlinks and outgoing links")
-def get_page(slug: Slug, _: Reader) -> dict[str, Any]:
+def get_page(request: Request, slug: Slug, _: Reader) -> dict[str, Any]:
     _ready()
-    return store.get_page(slug)
+    return store.get_page(slug, include_local=_local(request))
 
 
 @app.get("/search", summary="Full-text search (FTS5) with highlighted snippets")
 def search(
+    request: Request,
     _: Reader,
     q: str = Query(min_length=1, max_length=200),
     limit: int = Query(default=20, ge=1, le=100),
 ) -> dict[str, Any]:
     _ready()
-    results = store.search(q, limit)
+    results = store.search(q, limit, include_local=_local(request))
     return {"query": q, "count": len(results), "results": results}
 
 
 @app.get("/history/{slug}", summary="git history of a page")
-def history(slug: Slug, _: Reader, limit: int = Query(default=50, ge=1, le=500)) -> dict[str, Any]:
+def history(request: Request, slug: Slug, _: Reader, limit: int = Query(default=50, ge=1, le=500)) -> dict[str, Any]:
     _ready()
-    return {"slug": slug, "history": store.history(slug, limit)}
+    return {"slug": slug, "history": store.history(slug, limit, include_local=_local(request))}
 
 
-@app.get("/recent", summary="Recent changes from log.md, newest first")
-def recent(_: Reader, limit: int = Query(default=50, ge=1, le=500)) -> dict[str, Any]:
+@app.get("/recent", summary="Recent operations from log.md, newest first")
+def recent(request: Request, _: Reader, limit: int = Query(default=50, ge=1, le=500)) -> dict[str, Any]:
     _ready()
-    return {"changes": store.recent(limit)}
+    return {"changes": store.recent(limit, include_local=_local(request))}
 
 
 # ---------------------------------------------------------------------------
-# Writes
+# The one write: raw/inbox
 # ---------------------------------------------------------------------------
 
 
-@app.put("/pages/{slug}", summary="Create a page, or fully replace one (needs base_updated)")
-def put_page(slug: Slug, page: PageIn, _: Writer) -> dict[str, Any]:
+@app.post("/inbox", summary="Drop material into raw/inbox/ for the librarian to ingest", status_code=201)
+def add_to_inbox(item: InboxIn, _: Writer) -> dict[str, Any]:
     _ready()
-    store.check_slug(slug)
-    data = page.model_dump()
-    _scrub({k: data[k] for k in ("title", "tags", "sources", "summary", "body")})
-    return store.put_page(slug, **data)
-
-
-@app.patch("/pages/{slug}", summary="Patch a page: append/replace a section, add tags or sources")
-def patch_page(slug: Slug, patch: PatchIn, _: Writer) -> dict[str, Any]:
-    _ready()
-    store.check_slug(slug)
-    data = patch.model_dump()
-    _scrub({"ops": data["ops"], "summary": data["summary"]})
-    return store.patch_page(slug, **data)
-
-
-@app.delete("/pages/{slug}", summary="Soft delete: move the page to _archive/")
-def archive_page(
-    slug: Slug,
-    _: Writer,
-    updated_by: str = Query(default="grok", pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$"),
-) -> dict[str, Any]:
-    _ready()
-    return store.archive_page(slug, updated_by=updated_by)
+    hits = scrubber.scan({"title": item.title, "content": item.content})
+    if hits:
+        _log.warning("pazbrain_secret_rejected", extra={"hits": hits})
+        raise HTTPException(422, {
+            "error": "secret_detected",
+            "detail": "Rejected: content looks like a secret or financial identifier. Remove it and retry.",
+            "matches": hits,
+        })
+    return store.add_to_inbox(title=item.title, content=item.content, source_agent=item.source_agent)
