@@ -57,8 +57,7 @@ _PATTERNS: list[tuple[str, list[str]]] = [
     ]),
     ("directions", [
         r"\bhow (?:do|can|should|would) (?:we|i|you) get\b", r"\bfrom .+ to\b", r"\bdirections?\b",
-        r"\bhow far\b", r"\bdistance\b", r"\bwalk(?:ing|able)?\b", r"\buber\b", r"\blyft\b",
-        r"\bcab\b", r"\bdrive\b", r"\bparking\b", r"\bget there\b",
+        r"\bhow far\b", r"\bdistance\b", r"\bparking\b", r"\bget there\b",
     ]),
     ("place", [
         r"\brestaurants?\b", r"\bbars?\b", r"\bdive\b", r"\bhonky[- ]?tonks?\b", r"\bbbq\b",
@@ -70,6 +69,13 @@ _PATTERNS: list[tuple[str, list[str]]] = [
         r"\bmarkets?\b", r"\bhat(?:ter)?s?\b",
     ]),
 ]
+
+# Ways of getting around count toward "directions" only in a question ("can we walk there?",
+# "uber or drive?"). A plain mention ("I bought walking shoes", 2026-11-03) is chat, not a route
+# request, and stays on the local model instead of going to Gemini/Grok.
+_TRANSPORT = [r"\bwalk(?:ing|able)?\b", r"\buber\b", r"\blyft\b", r"\bcab\b", r"\bdrive\b"]
+_QUESTION = re.compile(r"\?|^\s*(?:is|are|can|could|should|would|do|does|how|what|which|where|any)\b", re.I)
+
 
 _DESTINATIONS: dict[str, list[str]] = {
     "plan_edit":  ["local"],
@@ -99,6 +105,8 @@ def classify_trip(query: str) -> tuple[str, dict[str, int]]:
         return "plan_edit", {}
     text = query.lower()
     scores = {name: sum(1 for p in pats if re.search(p, text)) for name, pats in _PATTERNS}
+    if _QUESTION.search(text):
+        scores["directions"] += sum(1 for p in _TRANSPORT if re.search(p, text))
     best, score = max(scores.items(), key=lambda kv: kv[1])  # first wins ties (priority order)
     return (best if score > 0 else "plan_edit"), scores
 

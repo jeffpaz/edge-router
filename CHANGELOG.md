@@ -4,6 +4,14 @@ All notable changes to edge-router are documented here.
 
 ---
 
+## 2026-11-03
+
+### Fixed
+- **tripBuddy chat that mentions walking or driving no longer goes to Gemini/Grok** (`trip_routes.py`). The trip sub-classifier counted any "walk", "walking", "walkable", "drive", "uber", "lyft" or "cab" as a `directions` request, so "I bought walking specific shoes…" was sent to Gemini and, with Gemini returning 503, to paid Grok.
+  - Those words now count toward `directions` only in a question (a `?`, or a message starting with is/are/can/could/should/would/do/does/how/what/which/where/any): "can we walk to the Alamo?", "uber or drive downtown?".
+  - "How far", "distance", "directions", "parking", "get there" and "from X to Y" still count on their own. A plain mention with no other signal falls to `plan_edit` on the local model.
+  - Tests: `tests/test_trip_classifier.py`.
+
 ## 2026-10-31
 
 ### Fixed
