@@ -39,7 +39,8 @@ LOG_MD = ROOT / "log.md"
 
 # type -> folder under wiki/
 FOLDERS = {"person": "people", "project": "projects", "area": "areas", "topic": "topics",
-           "source": "sources", "concept": "concepts"}
+           "source": "sources", "concept": "concepts",
+           "meeting": "meetings"}
 TYPES = tuple(FOLDERS)
 VISIBILITY = ("cloud", "local-only")
 ARCHIVE = "_archive"
