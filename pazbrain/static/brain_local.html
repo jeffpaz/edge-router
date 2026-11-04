@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>PazBrain (LAN)</title>
+<style>
+:root {
+  --bg: #f7f6f3; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6a66; --line: #e4e2dc;
+  --accent: #2f5d8a; --accent-soft: #e6eef6; --local: #9a3b2e; --local-soft: #f7e7e3;
+  --cloud: #2f6b45; --cloud-soft: #e3f1e8; --code: #f1efea; --mark: #fff1b8;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161615; --panel: #1f1f1d; --text: #ecebe6; --muted: #a09e97; --line: #33322f;
+    --accent: #8db6dd; --accent-soft: #23303c; --local: #f0a090; --local-soft: #3a2420;
+    --cloud: #8fd0a6; --cloud-soft: #1e3326; --code: #2a2926; --mark: #5a4a10;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); }
+body { font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+header { display: flex; gap: 12px; align-items: center; padding: 10px 16px; border-bottom: 1px solid var(--line);
+         background: var(--panel); position: sticky; top: 0; z-index: 2; }
+header h1 { font-size: 16px; margin: 0; white-space: nowrap; }
+header h1 small { color: var(--muted); font-weight: 400; }
+#q { flex: 1; min-width: 0; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px;
+     background: var(--bg); color: var(--text); font: inherit; }
+header nav { display: flex; gap: 10px; white-space: nowrap; font-size: 14px; }
+main { display: grid; grid-template-columns: 300px minmax(0, 1fr); min-height: calc(100vh - 53px); }
+aside { border-right: 1px solid var(--line); padding: 12px 10px; overflow-y: auto; max-height: calc(100vh - 53px);
+        position: sticky; top: 53px; background: var(--panel); }
+#content { padding: 20px 28px 60px; max-width: 900px; }
+.filters { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.chip { border: 1px solid var(--line); background: var(--bg); color: var(--text); border-radius: 999px;
+        padding: 2px 10px; font: inherit; font-size: 13px; cursor: pointer; }
+.chip.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.group h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 14px 6px 4px; }
+.item { display: block; padding: 5px 8px; border-radius: 6px; color: var(--text); font-size: 14px; }
+.item:hover, .item.cur { background: var(--accent-soft); text-decoration: none; }
+.item .t { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.badge { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px; vertical-align: 2px;
+         background: var(--code); color: var(--muted); margin-left: 4px; }
+.badge.local { background: var(--local-soft); color: var(--local); }
+.badge.cloud { background: var(--cloud-soft); color: var(--cloud); }
+.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; background: var(--cloud); }
+.dot.local { background: var(--local); }
+.meta { color: var(--muted); font-size: 13px; margin: 4px 0 14px; }
+.summary { font-size: 16px; margin: 0 0 18px; color: var(--text); }
+article h1 { font-size: 26px; line-height: 1.25; margin: 0 0 6px; }
+article h2 { font-size: 19px; margin: 26px 0 8px; padding-bottom: 4px; border-bottom: 1px solid var(--line); }
+article h3 { font-size: 16px; margin: 20px 0 6px; }
+article code { background: var(--code); padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+article pre { background: var(--code); padding: 10px 12px; border-radius: 8px; overflow-x: auto; }
+article pre code { background: none; padding: 0; }
+article blockquote { margin: 10px 0; padding: 2px 14px; border-left: 3px solid var(--line); color: var(--muted); }
+article table { border-collapse: collapse; margin: 10px 0; display: block; overflow-x: auto; }
+article th, article td { border: 1px solid var(--line); padding: 5px 9px; text-align: left; vertical-align: top; }
+article ul, article ol { padding-left: 22px; }
+a.wl.missing { color: var(--muted); border-bottom: 1px dashed var(--muted); }
+.box { border: 1px solid var(--line); background: var(--panel); border-radius: 10px; padding: 12px 14px; margin: 18px 0; }
+.box h4 { margin: 0 0 6px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.result { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.result .snip { color: var(--muted); font-size: 14px; }
+mark { background: var(--mark); color: inherit; border-radius: 2px; }
+.stats { display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0 20px; }
+.stat { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; min-width: 110px; }
+.stat b { display: block; font-size: 22px; }
+.stat span { color: var(--muted); font-size: 13px; }
+.err { color: var(--local); }
+#login { max-width: 460px; margin: 60px auto; }
+#login input { width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel);
+               color: var(--text); font: inherit; margin: 8px 0; }
+button.primary { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 8px 16px; font: inherit; cursor: pointer; }
+.linkbtn { background: none; border: 0; color: var(--accent); font: inherit; cursor: pointer; padding: 0; }
+@media (max-width: 760px) {
+  header { flex-wrap: wrap; }
+  header nav { order: 3; width: 100%; }
+  main { grid-template-columns: 1fr; }
+  aside { position: static; max-height: 40vh; border-right: 0; border-bottom: 1px solid var(--line); }
+  #content { padding: 16px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>PazBrain <small>LAN</small></h1>
+  <input id="q" type="search" placeholder="Search everything, local-only included" autocomplete="off">
+  <nav><a href="#/">Home</a><a href="#/recent">Recent</a><button class="linkbtn" id="logout" title="Forget the read token in this browser">Sign out</button></nav>
+</header>
+<main>
+  <aside>
+    <div class="filters" id="vis"></div>
+    <div class="filters" id="types"></div>
+    <div id="list"></div>
+  </aside>
+  <section id="content"></section>
+</main>
+
+<script>
+"use strict";
+const API = "/brain/api";
+const KEY = "pazbrain_read_token";
+const TYPES = ["person", "project", "meeting", "area", "topic", "concept", "source"];
+const PLURAL = {person: "People", project: "Projects", meeting: "Meetings", area: "Areas", topic: "Topics", concept: "Concepts", source: "Sources"};
+let pages = [], bySlug = new Map(), fType = "", fVis = "";
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const store = { get() { try { return localStorage.getItem(KEY) || ""; } catch { return ""; } },
+                set(v) { try { localStorage.setItem(KEY, v); } catch {} },
+                clear() { try { localStorage.removeItem(KEY); } catch {} } };
+
+async function api(path) {
+  const r = await fetch(API + path, {headers: {Authorization: "Bearer " + store.get()}, cache: "no-store"});
+  if (r.status === 401 || r.status === 403) { store.clear(); showLogin("That token was refused. Paste the read token again."); throw new Error("auth"); }
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  return r.json();
+}
+
+// --- Markdown (small, escape-first: nothing from a page is ever inserted as raw HTML) ---
+function inline(text) {
+  let s = esc(text);
+  const codes = [];
+  s = s.replace(/`([^`]+)`/g, (_, c) => { codes.push(c); return `\u0000${codes.length - 1}\u0000`; });
+  s = s.replace(/\[\[([^\]|]+?)(?:\|([^\]]+))?\]\]/g, (_, slug, label) => {
+    const p = bySlug.get(slug.trim());
+    return `<a class="wl${p ? "" : " missing"}" href="#/page/${encodeURIComponent(slug.trim())}">${label || (p ? esc(p.title) : slug)}</a>`;
+  });
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer noopener">$1</a>');
+  s = s.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noreferrer noopener">$2</a>');
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>").replace(/(^|[^*])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>");
+  s = s.replace(/\\([\\`*_{}\[\]()#+\-.!~])/g, "$1");
+  return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${codes[+i]}</code>`);
+}
+
+function markdown(src) {
+  const lines = String(src || "").replace(/\r/g, "").split("\n");
+  const out = []; let i = 0;
+  while (i < lines.length) {
+    const l = lines[i];
+    if (/^```/.test(l)) {
+      const buf = []; i++;
+      while (i < lines.length && !/^```/.test(lines[i])) buf.push(lines[i++]);
+      i++; out.push(`<pre><code>${esc(buf.join("\n"))}</code></pre>`); continue;
+    }
+    let m;
+    if ((m = l.match(/^(#{1,6})\s+(.*)$/))) { const n = Math.min(m[1].length + 1, 6); out.push(`<h${n}>${inline(m[2])}</h${n}>`); i++; continue; }
+    if (/^\s*\|.*\|\s*$/.test(l) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+      const row = (r) => r.trim().replace(/^\||\|$/g, "").split("|").map((c) => inline(c.trim()));
+      let html = "<table><thead><tr>" + row(l).map((c) => `<th>${c}</th>`).join("") + "</tr></thead><tbody>";
+      i += 2;
+      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) html += "<tr>" + row(lines[i++]).map((c) => `<td>${c}</td>`).join("") + "</tr>";
+      out.push(html + "</tbody></table>"); continue;
+    }
+    if (/^\s*([-*+]|\d+[.)])\s+/.test(l)) {
+      const stack = [];
+      while (i < lines.length && (/^\s*([-*+]|\d+[.)])\s+/.test(lines[i]) || (/^\s{2,}\S/.test(lines[i]) && stack.length))) {
+        const li = lines[i].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+        if (!li) { out.push(" " + inline(lines[i].trim())); i++; continue; }
+        const depth = Math.floor(li[1].replace(/\t/g, "  ").length / 2), tag = /\d/.test(li[2]) ? "ol" : "ul";
+        while (stack.length > depth + 1) out.push(`</li></${stack.pop()}>`);
+        if (stack.length === depth + 1 && stack[depth] !== tag) out.push(`</li></${stack.pop()}>`);
+        if (stack.length < depth + 1) { out.push(`<${tag}><li>`); stack.push(tag); }
+        else out.push("</li><li>");
+        out.push(inline(li[3])); i++;
+      }
+      while (stack.length) out.push(`</li></${stack.pop()}>`);
+      continue;
+    }
+    if (/^>\s?/.test(l)) {
+      const buf = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) buf.push(lines[i++].replace(/^>\s?/, ""));
+      out.push(`<blockquote>${markdown(buf.join("\n"))}</blockquote>`); continue;
+    }
+    if (/^\s*(---|\*\*\*)\s*$/.test(l)) { out.push("<hr>"); i++; continue; }
+    if (!l.trim()) { i++; continue; }
+    const buf = [];
+    while (i < lines.length && lines[i].trim() && !/^(#{1,6}\s|```|>|\s*([-*+]|\d+[.)])\s)/.test(lines[i]) && !/^\s*\|.*\|\s*$/.test(lines[i])) buf.push(lines[i++]);
+    out.push(`<p>${buf.map(inline).join("<br>")}</p>`);
+  }
+  return out.join("");
+}
+
+// --- Views ---
+const visBadge = (v) => v === "local-only" ? '<span class="badge local">local-only</span>' : '<span class="badge cloud">cloud</span>';
+const fmtDate = (d) => (d ? String(d).slice(0, 10) : "");
+
+function renderList() {
+  $("vis").innerHTML = [["", "All"], ["local-only", "Local-only"], ["cloud", "Cloud"]]
+    .map(([v, l]) => `<button class="chip${fVis === v ? " on" : ""}" data-vis="${v}">${l}</button>`).join("");
+  const present = TYPES.filter((t) => pages.some((p) => p.type === t));
+  $("types").innerHTML = [["", "All types"], ...present.map((t) => [t, PLURAL[t]])]
+    .map(([v, l]) => `<button class="chip${fType === v ? " on" : ""}" data-type="${v}">${l}</button>`).join("");
+  const cur = decodeURIComponent((location.hash.match(/^#\/page\/(.+)$/) || [])[1] || "");
+  const shown = pages.filter((p) => (!fType || p.type === fType) && (!fVis || p.visibility === fVis));
+  $("list").innerHTML = TYPES.filter((t) => shown.some((p) => p.type === t)).map((t) => {
+    const items = shown.filter((p) => p.type === t).sort((a, b) => a.title.localeCompare(b.title));
+    return `<div class="group"><h3>${PLURAL[t]} (${items.length})</h3>` + items.map((p) =>
+      `<a class="item${p.slug === cur ? " cur" : ""}" href="#/page/${encodeURIComponent(p.slug)}" title="${esc(p.summary || "")}">` +
+      `<span class="t"><span class="dot${p.visibility === "local-only" ? " local" : ""}"></span>${esc(p.title)}</span></a>`).join("") + "</div>";
+  }).join("") || '<p class="meta">No pages match.</p>';
+}
+
+async function viewHome() {
+  const local = pages.filter((p) => p.visibility === "local-only").length;
+  const counts = TYPES.filter((t) => pages.some((p) => p.type === t)).map((t) =>
+    `<div class="stat"><b>${pages.filter((p) => p.type === t).length}</b><span>${PLURAL[t]}</span></div>`).join("");
+  const newest = [...pages].sort((a, b) => String(b.updated).localeCompare(String(a.updated))).slice(0, 12);
+  $("content").innerHTML = `<article><h1>PazBrain</h1>
+    <p class="meta">Everything in the wiki, including local-only pages. This page only works on the home network.</p>
+    <div class="stats"><div class="stat"><b>${pages.length}</b><span>Pages</span></div>
+      <div class="stat"><b>${local}</b><span>Local-only</span></div><div class="stat"><b>${pages.length - local}</b><span>Cloud</span></div>${counts}</div>
+    <h2>Recently updated</h2>` + newest.map((p) =>
+      `<div class="result"><a href="#/page/${encodeURIComponent(p.slug)}"><strong>${esc(p.title)}</strong></a>${visBadge(p.visibility)}<span class="badge">${esc(p.type)}</span>
+       <div class="snip">${esc(p.summary || "")}</div><div class="meta">Updated ${esc(fmtDate(p.updated))}</div></div>`).join("") + "</article>";
+}
+
+async function viewPage(slug) {
+  $("content").innerHTML = '<p class="meta">Loading…</p>';
+  let p;
+  try { p = await api("/pages/" + encodeURIComponent(slug)); }
+  catch (e) { if (e.message !== "auth") $("content").innerHTML = `<p class="err">Couldn't load ${esc(slug)}: ${esc(e.message)}</p>`; return; }
+  const list = (arr) => (arr || []).map((x) => typeof x === "string" ? x : (x.slug || x.ref || JSON.stringify(x)));
+  const backs = (p.backlinks || []).map((b) => `<li><a href="#/page/${encodeURIComponent(b.slug)}">${esc(b.title || b.slug)}</a></li>`).join("");
+  const sources = list(p.sources).map((s) => `<li><code>${esc(s)}</code></li>`).join("");
+  $("content").innerHTML = `<article>
+    <h1>${esc(p.title)}</h1>
+    <div class="meta">${visBadge(p.visibility)}<span class="badge">${esc(p.type)}</span>
+      ${p.confidence ? `<span class="badge">confidence ${esc(p.confidence)}</span>` : ""}
+      &nbsp;Updated ${esc(fmtDate(p.updated))}${p.created ? ` · created ${esc(fmtDate(p.created))}` : ""} · <code>${esc(p.slug)}</code></div>
+    ${p.summary ? `<p class="summary">${inline(p.summary)}</p>` : ""}
+    ${markdown(p.body)}
+    ${backs ? `<div class="box"><h4>Linked from</h4><ul>${backs}</ul></div>` : ""}
+    ${sources ? `<div class="box"><h4>Sources</h4><ul>${sources}</ul></div>` : ""}
+    <div class="box"><h4>History</h4><div id="hist" class="meta">Loading…</div></div></article>`;
+  window.scrollTo(0, 0);
+  renderList();
+  try {
+    const h = await api("/history/" + encodeURIComponent(slug));
+    $("hist").innerHTML = (h.history || []).slice(0, 15).map((c) =>
+      `<div>${esc(fmtDate(c.date))} · <code>${esc(String(c.commit).slice(0, 7))}</code> ${esc(c.message)}</div>`).join("") || "No history.";
+  } catch { if ($("hist")) $("hist").textContent = "History unavailable."; }
+}
+
+async function viewSearch(q) {
+  $("content").innerHTML = '<p class="meta">Searching…</p>';
+  let r;
+  try { r = await api("/search?limit=50&q=" + encodeURIComponent(q)); } catch (e) { if (e.message !== "auth") $("content").innerHTML = `<p class="err">${esc(e.message)}</p>`; return; }
+  // The API sends snippets HTML-escaped with its own <mark> tags: decode in an inert document,
+  // re-escape everything, and put back only the marks.
+  const snip = (s) => {
+    const t = String(s || "").replace(/<mark>/g, "\u0002").replace(/<\/mark>/g, "\u0003");
+    const text = new DOMParser().parseFromString(t, "text/html").documentElement.textContent || "";
+    return esc(text).replace(/\u0002/g, "<mark>").replace(/\u0003/g, "</mark>");
+  };
+  $("content").innerHTML = `<article><h1>Search: ${esc(q)}</h1><p class="meta">${r.count} result${r.count === 1 ? "" : "s"}</p>` +
+    r.results.map((x) => `<div class="result"><a href="#/page/${encodeURIComponent(x.slug)}"><strong>${esc(x.title)}</strong></a>${visBadge(x.visibility)}<span class="badge">${esc(x.type)}</span>
+      <div class="snip">${snip(x.snippet || x.summary)}</div></div>`).join("") + "</article>";
+}
+
+async function viewRecent() {
+  $("content").innerHTML = '<p class="meta">Loading…</p>';
+  let r;
+  try { r = await api("/recent?limit=100"); } catch (e) { if (e.message !== "auth") $("content").innerHTML = `<p class="err">${esc(e.message)}</p>`; return; }
+  $("content").innerHTML = "<article><h1>Recent changes</h1>" + (r.changes || []).map((c) =>
+    `<div class="result"><div class="meta">${esc(c.date)} · ${esc(c.action)} · ${esc(c.updated_by)}</div>
+     ${c.slug ? `<a href="#/page/${encodeURIComponent(c.slug)}">${esc(c.slug)}</a> ` : ""}<span>${inline(c.summary || "")}</span></div>`).join("") + "</article>";
+}
+
+function route() {
+  const h = location.hash || "#/";
+  let m;
+  if ((m = h.match(/^#\/page\/(.+)$/))) return viewPage(decodeURIComponent(m[1]));
+  if ((m = h.match(/^#\/search\/(.*)$/))) { const q = decodeURIComponent(m[1]); $("q").value = q; return q ? viewSearch(q) : viewHome(); }
+  if (h === "#/recent") return viewRecent();
+  renderList();
+  return viewHome();
+}
+
+function showLogin(msg) {
+  document.querySelector("main").style.display = "none";
+  document.querySelector("header nav").style.visibility = "hidden";
+  let box = $("login");
+  if (!box) { box = document.createElement("section"); box.id = "login"; document.body.appendChild(box); }
+  box.innerHTML = `<h2>PazBrain on the home network</h2>
+    <p class="meta">${esc(msg || "Paste the PazBrain read token (PAZBRAIN_READ_TOKEN in /etc/pazbrain.env on the Jetson). It stays in this browser only.")}</p>
+    <form id="tokform"><input id="tok" type="password" autocomplete="off" placeholder="Read token" required><button class="primary">Open the brain</button></form>`;
+  $("tokform").addEventListener("submit", (e) => { e.preventDefault(); store.set($("tok").value.trim()); location.reload(); });
+}
+
+async function start() {
+  if (!store.get()) return showLogin();
+  try {
+    const r = await api("/pages?limit=1000");
+    pages = r.pages || [];
+    bySlug = new Map(pages.map((p) => [p.slug, p]));
+  } catch (e) { if (e.message !== "auth") $("content").innerHTML = `<p class="err">Couldn't reach /brain/api: ${esc(e.message)}</p>`; return; }
+  renderList();
+  route();
+}
+
+$("vis").addEventListener("click", (e) => { const b = e.target.closest("[data-vis]"); if (b) { fVis = b.dataset.vis; renderList(); } });
+$("types").addEventListener("click", (e) => { const b = e.target.closest("[data-type]"); if (b) { fType = b.dataset.type; renderList(); } });
+$("logout").addEventListener("click", () => { store.clear(); location.reload(); });
+let timer;
+$("q").addEventListener("input", (e) => { clearTimeout(timer); timer = setTimeout(() => { location.hash = "#/search/" + encodeURIComponent(e.target.value.trim()); }, 300); });
+window.addEventListener("hashchange", route);
+start();
+</script>
+</body>
+</html>

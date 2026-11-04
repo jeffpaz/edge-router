@@ -47,7 +47,7 @@ app = FastAPI(
 )
 
 Slug = Annotated[str, Path(description="Page slug, ^[a-z0-9][a-z0-9-]{0,80}$", max_length=81)]
-PageType = Literal["person", "project", "area", "topic", "source", "concept"]
+PageType = Literal["person", "project", "area", "topic", "source", "concept", "meeting"]
 Agent = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$", description="Who sent it, e.g. grok")]
 
 

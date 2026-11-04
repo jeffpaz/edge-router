@@ -2184,3 +2184,7 @@ app.mount("/brain/api", pazbrain.routes.app)
 # behind a unix socket (additive; see pazbrain/query_routes.py)
 import pazbrain.query_routes  # noqa: E402
 app.include_router(pazbrain.query_routes.router)
+
+# LAN-only page for browsing all of PazBrain (404 through the tunnel; see pazbrain/local_ui.py)
+import pazbrain.local_ui  # noqa: E402
+app.include_router(pazbrain.local_ui.router)
